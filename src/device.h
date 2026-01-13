@@ -28,8 +28,8 @@
 #define A0 (PA0)
 #define A1 (PA1)
 
-#define FOC_IN3_PWM (PA2) // TIM2 CH3
-#define FOC_IN2_PWM (PB3) // TIM2 CH2
+#define FOC_IN2_PWM (PA2) // TIM2 CH3
+#define FOC_IN3_PWM (PB3) // TIM2 CH2
 #define FOC_IN1_PWM (PA15) // TIM2 CH1
 #define FOC_EN (PA3)
 
@@ -52,10 +52,14 @@
 #define INVALID_DEVICE (0)
 
 uint8_t get_device_id();
-void set_device_id(uint8_t );
+void set_device_id(uint8_t value);
 uint32_t get_serial_no();
-uint8_t get_fw_ver();
+uint32_t get_fw_ver();
+// Seconds since epoch
+uint64_t get_build_ts();
+// 20 bytes for git sha1
+uint8_t* get_build_commit();
 uint8_t get_protocol_ver();
-uint8_t get_hw_ver();
+uint32_t get_hw_ver();
 
 #endif // _DEVICE_H_

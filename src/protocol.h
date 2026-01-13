@@ -14,16 +14,26 @@
 // Handshake protocol
 // Controller & Device Power ON
 // 1) Devices power on
-// 2) Devices send discovery query, containing serial no and INVALID_ID
-// 3) Controller responds with serial no and a valid id assignment
-//      3a) Controller should map serial no to id persistantly
-//      3b) Controller should map serial/id to axis/control
+// 2) Devices send discovery query on DISCOVERY_REQUEST_ID, containing serial_no
+// 3) Controller responds with serial_no and a valid id assignment on DISCOVERY_ASSIGN_ID
+//      3a) Controller should map serial_no to id persistantly
+//      3b) Controller should map serial_no/id to axis/control
+// 4) Device reports INFO on device channel (DEVICE_BASE_ID + assigned_id)
+// The device is now ready to respond to commands
 
-#define INVALID_ID (0)
-#define CONTROLLER_ID (2)
-#define CONTROLLER_DISCOVERY (4)
-#define DEVICE_DISCOVERY (8)
-#define DEVICE_GENERAL (16)
+// Controller sends commands to a device on the device ID channel using the Controller Command type
+// The device responds on the same channel, using the DEVICE Command type (controller type + 1)
+
+// CAN IDs 0 through 7 are reserved
+// The main controller/host should use ID 0
+// Devices needing to be discovered should use ID 1
+// Configured Devices should use IDs 8-2047
+
+#define CONTROL_ID (0x00)
+#define DISCOVERY_ASSIGN_ID (0x01)
+#define DISCOVERY_REQUEST_ID (0x02)
+// Devices use upper 8 bits of ID
+#define DEVICE_BASE_ID (0x08)
 
 #define DEVICE_HEADER_SIZE (2)
 
@@ -53,6 +63,8 @@ typedef enum {
     DEVICE_ACK,
     CONTROLLER_START_FW_UPDATE,
     DEVICE_FW_UPDATE,
+    CONTROLLER_NETWORK_RESET,
+    DEVICE_NETWORK_RESET,
 } command_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
@@ -79,8 +91,8 @@ typedef struct __attribute__((packed, aligned(1))) {
 } device_analog_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
-    uint8_t srv0;
-    uint8_t srv1;
+    uint16_t srv0;
+    uint16_t srv1;
 } device_servo_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
@@ -103,17 +115,16 @@ typedef struct __attribute__((packed, aligned(1))) {
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint8_t sequence_id;
-    uint8_t data[5];
+    uint8_t data[6];
 } stream_data_t;
 
 // Top level message structs
 typedef struct __attribute__((packed, aligned(4))) {
     uint32_t serial_no;
-    uint8_t device_id;
+    uint8_t id_value; // Assign or previous ID
 } discovery_message_t;
 
 typedef struct __attribute__((packed, aligned(4))) {
-    uint8_t device_id;
     uint8_t cmd; // command_t
     union {
         device_info_t info_data;
@@ -130,6 +141,6 @@ typedef struct __attribute__((packed, aligned(4))) {
 
 static_assert(sizeof(device_message_t) <= 8, "device_message_t overflows CAN packet");
 
-// Command protocol: 1 byte of opcode, 1 bytes of address, 4 bytes of data
+// Command protocol: 1 byte of opcode,  1-7 bytes of data
 
 #endif // PROTOCOL_H_

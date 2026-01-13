@@ -19,6 +19,8 @@
 #include <drivers/BLDCDriver3PWM.h>
 #include <encoders/MT6701/MagneticSensorMT6701SSI.h>
 
+#include <drivers/hardware_specific/stm32/stm32_mcu.h>
+
 class CommandHandler;
 
 #include "device.h"
@@ -29,6 +31,7 @@ class CommandHandler;
 #include "can_parser.h"
 
 #define LED_DUTY_DEFAULT (25)
+#define FOC_PWM_FREQ (50000)
 
 class CommandHandler
 {
@@ -42,18 +45,17 @@ private:
     SerialParser serial_interface;
     CANParser can_interface;
     Scheduler ts;
-    Task iut;
-    Task ims;
-    Task ldt;
+    Task critical_task;
+    Task standard_task;
+    Task lazy_task;
     bool sys_state;
     bool stat_state;
 
-    inline void set_pwm(HardwareTimer* timer, int pin, uint32_t duty, uint32_t freq)
+    void set_pwm(HardwareTimer* timer, int pin, uint32_t duty, uint32_t freq)
     {
         if (timer)
         {
-            PinName name = digitalPinToPinName(pin);
-            uint32_t channel = STM_PIN_CHANNEL(name);
+            uint32_t channel = STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(pin), PinMap_PWM));
             timer->setPWM(channel, pin, freq, duty);
         }
     }
@@ -83,7 +85,7 @@ private:
         // De-power motor, blink sys led
     }
 
-    void update_motion_system()
+    void update_critical()
     {
         motor.loopFOC();
         encoder.update();
@@ -92,13 +94,13 @@ private:
         motor.move(target_voltage);
     }
 
-    void update_external_interfaces()
+    void update_standard()
     {
         serial_interface.read();
         can_interface.read();
     }
 
-    void update_leds()
+    void update_lazy()
     {
         sys_state = !sys_state;
         set_led(LED_SYS_PWM, sys_state ? LED_DUTY_DEFAULT : 0);
@@ -209,7 +211,7 @@ private:
                 break;
                 case CONTROLLER_SET_LED:
                 {
-                    ldt.disable();
+                    lazy_task.disable();
                     set_led(LED_SYS_PWM, msg->led_data.sys);
                     set_led(LED_STAT_PWM, msg->led_data.stat);
                     device_message_t reply {
@@ -271,13 +273,13 @@ private:
 public:
     CommandHandler() : 
         encoder(ENCODER_CSN),
-        motor(11, 11.1),
+        motor(11, 5.05f/2.0),
         motor_driver(FOC_IN1_PWM, FOC_IN2_PWM, FOC_IN3_PWM, FOC_EN),
         led_timer(TIM3), 
         servo_timer(TIM4),
-        iut(10 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_external_interfaces, this), &ts, true),
-        ims(3 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_motion_system, this), &ts, true),
-        ldt(250 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_leds, this), &ts, true),
+        critical_task(3 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_critical, this), &ts, true),
+        standard_task(10 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_standard, this), &ts, true),
+        lazy_task(250 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_lazy, this), &ts, true),
         serial_interface(std::bind(&CommandHandler::handle_device_message,
                                     this,
                                     std::placeholders::_1,
@@ -311,9 +313,9 @@ public:
         set_servo(SRV0_PWM, 0);
         set_servo(SRV1_PWM, 0);
 
-        attachInterrupt(ENDSTOP0, std::bind(&CommandHandler::handle_endstop0, this), FALLING);
-        attachInterrupt(ENDSTOP1, std::bind(&CommandHandler::handle_endstop1, this), FALLING);
-        attachInterrupt(M_NFAULT, std::bind(&CommandHandler::handle_motor_fault, this), FALLING);
+        attachInterrupt(digitalPinToInterrupt(ENDSTOP0), std::bind(&CommandHandler::handle_endstop0, this), FALLING);
+        attachInterrupt(digitalPinToInterrupt(ENDSTOP1), std::bind(&CommandHandler::handle_endstop1, this), FALLING);
+        attachInterrupt(digitalPinToInterrupt(M_NFAULT), std::bind(&CommandHandler::handle_motor_fault, this), FALLING);
 
         // Enable motor
         digitalWrite(M_NSLEEP, HIGH);
@@ -322,10 +324,12 @@ public:
         SPI.setMOSI(PA7);
         SPI.setMISO(PA6);
         SPI.setSCLK(PA5);
+        SPI.setSSEL(PA4);
         SPI.begin();
         encoder.init(&SPI);
         motor_driver.voltage_power_supply = MOTOR_SUPPLY_VOLTAGE;
         motor_driver.voltage_limit = MOTOR_OPERATING_VOLTAGE;
+        motor_driver.pwm_frequency = FOC_PWM_FREQ;
         motor_driver.init();
         motor.current_limit = MOTOR_CURRENT_LIMIT;
         motor.torque_controller = TorqueControlType::voltage;
@@ -334,13 +338,17 @@ public:
         motor.linkDriver(&motor_driver);
         motor.init();
         motor.useMonitoring(Serial3);
-        motor.voltage_sensor_align = MOTOR_OPERATING_VOLTAGE / 2.0f;
+        motor.voltage_sensor_align = MOTOR_OPERATING_VOLTAGE;
         motor.initFOC();
         encoder.update();
         kinematics.set_zero(encoder.getSensorAngle());
-        iut.setSchedulingOption(TASK_SCHEDULE_NC);
-        ldt.setSchedulingOption(TASK_INTERVAL);
-        ims.setSchedulingOption(TASK_SCHEDULE_NC);
+        critical_task.setSchedulingOption(TASK_SCHEDULE_NC);
+        lazy_task.setSchedulingOption(TASK_INTERVAL);
+        standard_task.setSchedulingOption(TASK_SCHEDULE_NC);
+        critical_task.enable();
+        standard_task.enable();
+        lazy_task.enable();
+    
         sys_state = true;
         stat_state = false;
     }
@@ -348,6 +356,7 @@ public:
     void run()
     {
         ts.execute();
+        yield();
     }
 };
 
