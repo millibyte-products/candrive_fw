@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use crate::{protocol::{CanDriveMessage}};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
-struct CommManager {
+pub struct CommManager {
     thread: Option<std::thread::JoinHandle<()>>,
     sink: Sender<CanDriveMessage>,
     source: Receiver<CanDriveMessage>,

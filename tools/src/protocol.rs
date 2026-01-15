@@ -1,4 +1,4 @@
-use std::{collections::btree_map::Values, fmt::{Display, Formatter}, str::FromStr};
+use std::{fmt::{Display, Formatter}, str::FromStr};
 
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt, ReadBytesExt};
 

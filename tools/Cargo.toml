@@ -1,15 +1,19 @@
 [package]
-name = "candrive-cli"
+name = "candrive"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "candrive_api"
+bench = false
+path = "src/lib.rs"
+
 [dependencies]
-argparse = "0.2.2"
 byteorder = "1.5.0"
 socketcan = {version = "3.5.0", features = ["tokio"] }
-futures-util = "0.3.28"
-tokio = {version = "1.49.0", features = ["sync", "rt-multi-thread", "macros", "bytes", "fs", "time", "io-std"]}
-tokio-util = "0.7.18"
 nb = "1.1.0"
-crossbeam = "0.8.4"
 crossbeam-channel = "0.5.15"
+
+[[bin]]
+name = "candrive-cli"
+path = "src/main.rs"

@@ -4,12 +4,11 @@ use crate::protocol::{CanDriveMessage, Commands, MotorBits, ProtocolData, Status
 use crate::util::Threaded;
 use std::borrow::BorrowMut;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-use std::time::Duration;
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
-pub struct IdPool {
+struct IdPool {
     free_ids: BTreeSet<u8>,
 }
 
@@ -48,7 +47,7 @@ where
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct Device {
+pub struct Device {
     serial: u32,
     fw_version: u8,
     hw_version: u8,
@@ -68,7 +67,7 @@ struct Device {
     foc_en: DeviceParameter<u8>,
 }
 
-struct DeviceManager {
+pub struct DeviceManager {
     devices: BTreeMap<DeviceId, Device>,
     id_pool: IdPool,
     can_message_queue_tx: Sender<CanDriveMessage>,
@@ -138,7 +137,7 @@ impl DeviceManager {
         return self.devices.get_mut(id);
     }
 
-    pub fn assign_device(&mut self, id: &DeviceId, serial: &u32) -> Result<DeviceId, String> {
+    fn assign_device(&mut self, id: &DeviceId, serial: &u32) -> Result<DeviceId, String> {
         match self.id_pool.take_next(Some(id.to_u8())) {
             Ok(assigned_id) => {
                 let dev_id = DeviceId::new(assigned_id);
@@ -168,7 +167,7 @@ impl DeviceManager {
         }
     }
 
-    pub fn handle_command(&mut self, msg: LocalCommands) -> Result<(), String> {
+    fn handle_command(&mut self, msg: LocalCommands) -> Result<(), String> {
         match msg {
             LocalCommands::ListDevices => {
                 self.devices.iter().for_each(|(id, dev)| {
@@ -180,7 +179,7 @@ impl DeviceManager {
         }
     }
 
-    pub fn handle_device_message(&mut self, msg: &CanDriveMessage) -> Result<(), String> {
+    fn handle_device_message(&mut self, msg: &CanDriveMessage) -> Result<(), String> {
         match msg {
             CanDriveMessage::DiscoveryReq {
                 serial,
@@ -189,8 +188,8 @@ impl DeviceManager {
                 self.handle_discovery(serial, previous_id)
             },
             CanDriveMessage::DiscoveryAssign {
-                serial,
-                assigned_id,
+                serial: _,
+                assigned_id: _,
             } => {
                 // TODO disable authoritative mode
                 Err("Warning: Second controller detected, conflicts likely".to_string())
@@ -199,7 +198,7 @@ impl DeviceManager {
         }
     }
 
-    pub fn handle_discovery(&mut self, dev_serial: &u32, previous_id: &u8) -> Result<(), String> {
+    fn handle_discovery(&mut self, dev_serial: &u32, previous_id: &u8) -> Result<(), String> {
         let assigned_id: DeviceId;
         match self.assign_device(&DeviceId::new(*previous_id), dev_serial) {
             Ok(id) => {
@@ -217,7 +216,7 @@ impl DeviceManager {
             assigned_id: assigned_id.to_u8(),
         }) {
             Ok(_) => {},
-            Err(e) => {
+            Err(_e) => {
                 return Err("Could send assign msg to device".to_string())
             }
         };
@@ -232,8 +231,8 @@ impl DeviceManager {
                     {
                         if let ProtocolData::Info {
                             serial,
-                            fw_version,
-                            hw_version,
+                            fw_version: _,
+                            hw_version: _,
                         } = data
                         {
                             if *dev_serial == *serial {
@@ -250,7 +249,7 @@ impl DeviceManager {
                 // Will update device from info struct
                 self.handle_device_message(&msg)
             },
-            Err(e) => Err("Could not assign device".to_string()), // Don't rewind device assignment, just use the next one
+            Err(_e) => Err("Could not assign device".to_string()), // Don't rewind device assignment, just use the next one
         }
     }
 
@@ -264,7 +263,7 @@ impl DeviceManager {
                 match cmd {
                     Commands::GET_INFO => {
                         if let ProtocolData::Info {
-                            serial,
+                            serial: _,
                             fw_version,
                             hw_version,
                         } = data
@@ -348,7 +347,7 @@ impl DeviceManager {
     }
 
     // Handles messages until a discriminant matches
-    pub fn wait_for_message(
+    fn wait_for_message(
         &mut self,
         predicate: impl Fn(&CanDriveMessage) -> bool) -> Result<CanDriveMessage, String>
     {
@@ -372,10 +371,10 @@ impl DeviceManager {
         query_cmd: Commands,
         query_data: ProtocolData,
     ) -> Result<(), String> {
-        if let Some(mut device_model) = self.get_device_mut(&query_id) {
+        if let Some(_device_model) = self.get_device_mut(&query_id) {
             match self.can_message_queue_tx.send(CanDriveMessage::Control { id: query_id, is_controller: true, cmd: query_cmd, data: query_data }) {
                 Ok(_) => {},
-                Err(e) => {
+                Err(_e) => {
                     return Err("Could not send control msg to device".to_string())
                 }
             }
@@ -384,12 +383,12 @@ impl DeviceManager {
                     CanDriveMessage::Control {
                         id,
                         is_controller,
-                        cmd,
-                        data,
+                        cmd: _,
+                        data: _,
                     } => {
                         if !*is_controller {
                             // Check for ack integrity
-                            if query_id == *id && matches!(query_cmd, cmd) {
+                            if query_id == *id && matches!(query_cmd, _cmd) {
                                 return true;
                             }
                         }
