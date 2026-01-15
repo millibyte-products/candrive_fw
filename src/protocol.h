@@ -21,8 +21,10 @@
 // 4) Device reports INFO on device channel (DEVICE_BASE_ID + assigned_id)
 // The device is now ready to respond to commands
 
-// Controller sends commands to a device on the device ID channel using the Controller Command type
-// The device responds on the same channel, using the DEVICE Command type (controller type + 1)
+// Controller sends commands to a device on the device ID channel setting the controller bit
+// The device responds on the same channel, resetting the controller bit and omitting any data
+// Device responds with ACK and echos the command on success
+// Device responds with ERROR and error code on failure
 
 // CAN IDs 0 through 7 are reserved
 // The main controller/host should use ID 0
@@ -37,35 +39,44 @@
 
 #define DEVICE_HEADER_SIZE (2)
 
+#define CONTROLLER_MESSAGE(x) (0x80 | x)
+#define DEVICE_MESSAGE(x) (0x80 ^ x)
+
 typedef enum {
-    CONTROLLER_GET_INFO = 0,
-    DEVICE_INFO,
-    CONTROLLER_SET_POSITION, // Fixed point, 16 bit
-    DEVICE_POSITION, // Fixed point, 16 bit
-    CONTROLLER_GET_STATUS,
-    DEVICE_STATUS, // Device status, position, motor fault, endstops
-    CONTROLLER_GET_ANALOG,
-    DEVICE_ANALOG, // Device ADC reads (2 x 16 bit)
-    CONTROLLER_SET_SERVO,
-    DEVICE_SERVO, // Device Servo values
-    CONTROLLER_SET_LED,
-    DEVICE_LED, // Device led values
-    CONTROLLER_SET_MOTOR,
-    DEVICE_MOTOR,
-    CONTROLLER_SET_FOC,
-    DEVICE_FOC,
+    NOOP = 0x00,
+    GET_INFO,
+    SET_POSITION, // Fixed point, 16 bit
+    GET_POSITION, // Fixed point, 16 bit
+    GET_STATUS,
+    GET_ANALOG,
+    GET_SERVO,
+    SET_SERVO,
+    SET_LED,
+    GET_LED, // Device led values
+    GET_MOTOR,
+    SET_MOTOR,
+    SET_FOC,
+    GET_FOC,
     // Streams allow uart <-> can bridging
-    CONTROLLER_STREAM_START, // Start streaming to device UART
-    DEVICE_STREAM_START, // Start streaming from device UART
-    CONTROLLER_STREAM_DATA, // Stream write (TX) data
-    DEVICE_STREAM_DATA, // Stream read (RX) data
-    CONTROLLER_ACK,
-    DEVICE_ACK,
-    CONTROLLER_START_FW_UPDATE,
-    DEVICE_FW_UPDATE,
-    CONTROLLER_NETWORK_RESET,
-    DEVICE_NETWORK_RESET,
+    STREAM_START, // Start streaming to device UART
+    STREAM_START, // Start streaming from device UART
+    STREAM_DATA, // Stream write (TX) data
+    STREAM_DATA, // Stream read (RX) data
+    ACK,
+    START_FW_UPDATE,
+    FW_UPDATE,
+    NETWORK_RESET,
+    ERROR,
+    // Messages cannot use the 8th bit (controller/device signal)
+    INVALID = 0x7F,
+    LIMIT = 0x7F,
 } command_t;
+
+typedef enum {
+    LED_STAT = 0,
+    LED_SYS,
+    N_LED_ADDRESSES,
+} led_address_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint32_t serial_no;
@@ -93,11 +104,13 @@ typedef struct __attribute__((packed, aligned(1))) {
 typedef struct __attribute__((packed, aligned(1))) {
     uint16_t srv0;
     uint16_t srv1;
+    uint8_t update_flags; // 00 - noop, 01 - set servo0, 10 - set servo1, 11 - both
 } device_servo_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
-    uint8_t stat;
     uint8_t sys;
+    uint8_t stat;
+    uint8_t update_flags; // 00 - noop, 01 - set sys, 10 - set stat, 11 - both
 } device_led_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
@@ -118,6 +131,11 @@ typedef struct __attribute__((packed, aligned(1))) {
     uint8_t data[6];
 } stream_data_t;
 
+typedef struct __attribute__((packed, aligned(1))) {
+    uint8_t error_code;
+    uint32_t error_message;
+} error_data_t;
+
 // Top level message structs
 typedef struct __attribute__((packed, aligned(4))) {
     uint32_t serial_no;
@@ -125,7 +143,8 @@ typedef struct __attribute__((packed, aligned(4))) {
 } discovery_message_t;
 
 typedef struct __attribute__((packed, aligned(4))) {
-    uint8_t cmd; // command_t
+    uint8_t is_controller : 1;
+    uint8_t command : 7; // command_t
     union {
         device_info_t info_data;
         device_position_t position_data;
@@ -136,6 +155,7 @@ typedef struct __attribute__((packed, aligned(4))) {
         device_motor_t motor_data;
         device_foc_t foc_data;
         stream_data_t stream_data;
+        error_data_t error_data;
     };
 } device_message_t;
 

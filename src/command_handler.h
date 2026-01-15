@@ -29,6 +29,7 @@ class CommandHandler;
 #include "kinematics.h"
 #include "serial_parser.h"
 #include "can_parser.h"
+#include "errors.h"
 
 #define LED_DUTY_DEFAULT (25)
 #define FOC_PWM_FREQ (50000)
@@ -212,12 +213,23 @@ private:
                 case CONTROLLER_SET_LED:
                 {
                     lazy_task.disable();
-                    set_led(LED_SYS_PWM, msg->led_data.sys);
-                    set_led(LED_STAT_PWM, msg->led_data.stat);
                     device_message_t reply {
                         .device_id = get_device_id(),
                         .cmd = DEVICE_ACK,
                     };
+                    switch(msg->led_data.index)
+                    {
+                        case LED_STAT:
+                            set_led(LED_STAT_PWM, msg->led_data.value);
+                            break;
+                            set_led(LED_SYS_PWM, msg->led_data.value);
+                            break;
+                        default:
+                            reply.cmd = DEVICE_ERROR;
+                            reply.error_data.error_code = ERROR_INVALID_LED_INDEX;
+                            reply.error_data.error_message = msg->led_data.index;
+                            break;
+                    }
                     if (reply_to)
                     {
                         reply_to->write(DEVICE_GENERAL, (uint8_t*)&reply, DEVICE_HEADER_SIZE);
