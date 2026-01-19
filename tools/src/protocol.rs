@@ -1,95 +1,92 @@
-use std::{fmt::{Display, Formatter}, str::FromStr};
-
-use byteorder::{ByteOrder, LittleEndian, WriteBytesExt, ReadBytesExt};
+use std::{fmt::{Display, Formatter, UpperHex}, str::FromStr};
+use log::{debug};
+use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use strum_macros::{EnumDiscriminants, EnumIter};
 
 pub const CONTROLLER_ID: u16 = 0x00;
 pub const DISCOVERY_ASSIGN_ID: u16 = 0x01;
 pub const DISCOVERY_REQUEST_ID: u16 = 0x02;
 pub const DEVICE_BASE_ID: u16 = 0x08;
+pub const MAX_DATA_LENGTH: usize = 8;
 
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, EnumDiscriminants)]
+#[strum_discriminants(derive(EnumIter))]
+#[strum_discriminants(name(CommandTypes))]
 pub enum Commands {
     #[default]
     NOOP = 0x00,
-    GET_INFO,
-    SET_POSITION, // Fixed point, 16 bit
-    GET_POSITION,         // Fixed point, 16 bit
-    GET_STATUS,
-    GET_ANALOG,
-    SET_SERVO,
-    GET_SERVO, // Device Servo values
-    SET_LED,
-    GET_LED,
-    GET_MOTOR,
-    SET_FOC,
-    GET_FOC,
+    GetInfo,
+    GetInfoExt,
+
+    GetPosition, // Fixed point, 16 bit
+    SetPosition,         // Fixed point, 16 bit
+
+    GetStatus,
+
+    GetAnalog,
+
+    GetServo,
+    SetServo, // Device Servo values
+
+    GetLed,
+    SetLed,
+
+    GetMotor,
+    SetMotor,
+
+    GetFOC,
+    SetFOC,
     // Streams allow uart <-> can bridging
-    STREAM_START, // Start streaming to device UART
-    STREAM_DATA,  // Stream write (TX) data
-    ACK,
-    START_FW_UPDATE,
-    FW_UPDATE,
-    NETWORK_RESET,
-    ERROR,
-    INVALID = 0x7F,
+    StreamStart, // Start streaming to device UART
+    StreamData,  // Stream write (TX) data
+    Ack,
+    StartFwUpdate,
+    FWUpdate,
+    NetworkReset,
+    OverwriteUserStore,
+    EraseUserStore,
+    RevokeConfig,
+    Error,
+    Invalid = 0x7F,
 }
 
 impl Commands {
-
     pub fn from_u8(value: u8) -> Commands {
         use Commands::*;
-        match value {
+        match value
+        {
             0 => NOOP,
-            1 =>GET_INFO,
-            2 =>SET_POSITION, // Fixed point, 16 bit
-            3=>GET_POSITION,         // Fixed point, 16 bit
-            4=>GET_STATUS,
-            5=>GET_ANALOG,
-            6=>SET_SERVO,
-            7=>GET_SERVO, // Device Servo values
-            8=>SET_LED,
-            9=>GET_LED,
-            10=>GET_MOTOR,
-            11=>SET_FOC,
-            12=>GET_FOC,
-            // Streams allow uart <-> can bridging
-            13=>STREAM_START, // Start streaming to device UART
-            14=>STREAM_DATA,  // Stream write (TX) data
-            15=>ACK,
-            16=>START_FW_UPDATE,
-            17=>FW_UPDATE,
-            18=>NETWORK_RESET,
-            19=>ERROR,
-            _ => INVALID,
+            1 => GetInfo,
+            2 => GetInfoExt,
+            3 => GetPosition,         // Fixed point, 16 bit
+            4 => SetPosition, // Fixed point, 16 bit
+            5 => GetStatus,
+            6 => GetAnalog,
+            7 => GetServo,
+            8 => SetServo,
+            9 => GetLed,
+            10 => SetLed,
+            11 => GetMotor,
+            12 => SetMotor,
+            13 => GetFOC,
+            14 => SetFOC,
+            15 => StreamStart, // Start streaming to device UART
+            16 => StreamData,  // Stream write (TX) data
+            17 => Ack,
+            18 => StartFwUpdate,
+            19 => FWUpdate,
+            20 => NetworkReset,
+            21 => OverwriteUserStore,
+            22 => EraseUserStore,
+            23 => RevokeConfig,
+            24 => Error,
+            _ => Invalid,
         }
     }
 
     pub fn to_u8(&self) -> u8 {
-        return match self {
-            Commands::NOOP => 0,
-            Commands::GET_INFO => 1,
-            Commands::SET_POSITION => 2,
-            Commands::GET_POSITION => 3,
-            Commands::GET_STATUS => 4,
-            Commands::GET_ANALOG => 5,
-            Commands::SET_SERVO => 6,
-            Commands::GET_SERVO => 7,
-            Commands::SET_LED => 8,
-            Commands::GET_LED => 9,
-            Commands::GET_MOTOR => 10,
-            Commands::SET_FOC => 11,
-            Commands::GET_FOC => 12,
-            Commands::STREAM_START => 13,
-            Commands::STREAM_DATA => 14,
-            Commands::ACK => 15,
-            Commands::START_FW_UPDATE => 16,
-            Commands::FW_UPDATE => 17,
-            Commands::NETWORK_RESET => 18,
-            Commands::ERROR => 19,
-            Commands::INVALID => 0x7F,
-            _ => 0x7F,
-        };
+        return self.index()
     }
 
     pub fn is_contoller_command(&self) -> bool {
@@ -99,6 +96,13 @@ impl Commands {
     pub fn is_device_command(&self) -> bool {
         return self.to_u8() % 2 == 1;
     }
+
+    pub fn index(&self) -> u8 {
+         // SAFETY: Because `Self` is marked `repr(u8)`, its layout is a `repr(C)` `union`
+        // between `repr(C)` structs, each of which has the `u8` discriminant as its first
+        // field, so we can read the discriminant without offsetting the pointer.
+        unsafe { *<*const _>::from(self).cast::<u8>() }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, Ord, Eq, PartialEq, PartialOrd, Hash)]
@@ -106,10 +110,15 @@ pub struct DeviceId {
     id: u8,
 }
 
+impl UpperHex for DeviceId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{:X} ({:X})", self.to_u8(), self.to_can_id())
+    }
+}
+
 impl Display for DeviceId {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{:?}", self.to_can_id());
-        Ok(())
+        write!(f, "{:?} ({:X})", self.to_u8(), self.to_can_id())
     }
 }
 
@@ -124,12 +133,12 @@ impl FromStr for DeviceId {
 
 impl DeviceId {
     pub fn to_can_id(&self) -> u16 {
-        return (self.id as u16) << 3;
+        return (self.id as u16) + DEVICE_BASE_ID;
     }
 
     pub fn from_can_id(id: u16) -> DeviceId {
         return DeviceId {
-            id: (id >> 3) as u8,
+            id: (id - DEVICE_BASE_ID) as u8,
         };
     }
 
@@ -140,15 +149,19 @@ impl DeviceId {
     pub fn to_u8(&self) -> u8 {
         return self.id;
     }
+
+    pub fn from_u8(id: u8) -> DeviceId {
+        return DeviceId { id };
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StatusBits {
-    endstop0: bool,
-    endstop1: bool,
-    misc: bool,
-    fault: bool,
-    mag: u8,
+    pub endstop0: bool,
+    pub endstop1: bool,
+    pub misc: bool,
+    pub fault: bool,
+    pub mag: u8,
 }
 
 impl StatusBits {
@@ -192,9 +205,9 @@ impl StatusBits {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MotorBits {
-    value: u16,
-    rst: bool,
-    sleep: bool,
+    pub value: u16,
+    pub rst: bool,
+    pub sleep: bool,
 }
 
 impl MotorBits {
@@ -228,14 +241,21 @@ impl MotorBits {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, EnumDiscriminants)]
+#[strum_discriminants(derive(EnumIter))]
+#[strum_discriminants(name(ProtocolDataTypes))]
 pub enum ProtocolData {
     #[default]
     Empty,
     Info {
         serial: u32,
-        fw_version: u8,
-        hw_version: u8,
+        fw_major: u8,
+        fw_minor: u8,
+        fw_patch: u8,
+    },
+    InfoExt {
+        flags: u8,
+        temperature: u8,
     },
     Position {
         value: u16,
@@ -262,9 +282,17 @@ pub enum ProtocolData {
         foc_3: u8,
         en: u8,
     },
+    StreamStart {
+        stream_target: u8,
+        stream_length: u16,
+        flags: u8,
+    },
     StreamFragment {
         sequence: u8,
-        data: [u8; 5],
+        data: [u8; 4],
+    },
+    RevokeConfig {
+        device_id: u8,
     },
     Error {
         code: u8,
@@ -272,8 +300,10 @@ pub enum ProtocolData {
     },
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, EnumDiscriminants)]
+#[strum_discriminants(derive(EnumIter))]
+#[strum_discriminants(name(CanDriveMessageTypes))]
 pub enum CanDriveMessage {
     DiscoveryReq {
         serial: u32,
@@ -289,160 +319,216 @@ pub enum CanDriveMessage {
         cmd: Commands,
         data: ProtocolData,
     },
+    Broadcast {
+        cmd: Commands,
+        data: ProtocolData
+    }
 }
 
 impl CanDriveMessage {
-    pub fn as_bytes(&self) -> Vec<u8> {
+    pub fn as_bytes(&self) -> Result<Vec<u8>, String> {
         let mut bytes: Vec<u8> = vec![];
+        fn handle_protocol_data(data: &ProtocolData) -> Result<Vec<u8>, String> {
+            let mut bytes: Vec<u8> = vec![];
+            match data {
+                ProtocolData::Empty => {}
+                ProtocolData::Info {
+                    serial,
+                    fw_major,
+                    fw_minor,
+                    fw_patch,
+                } => {
+                    bytes.write_u32::<LittleEndian>(*serial).map_err(|e| e.to_string())?;
+                    bytes.push(*fw_major);
+                    bytes.push(*fw_minor);
+                    bytes.push(*fw_patch);
+                }
+                ProtocolData::InfoExt { flags, temperature }    => {
+                    bytes.push(*flags);
+                    bytes.write_u8(*temperature).map_err(|e| e.to_string())?;
+                }
+                ProtocolData::Position { value } => {
+                    bytes.write_u16::<LittleEndian>(*value).map_err(|e|e.to_string())?;
+                }
+                ProtocolData::Status(status) => {
+                    bytes.extend(status.to_bytes());
+                }
+                ProtocolData::Analog { a0, a1 } => {
+                    bytes.write_u16::<LittleEndian>(*a0).map_err(|e| e.to_string())?;
+                    bytes.write_u16::<LittleEndian>(*a1).map_err(|e| e.to_string())?;
+                    bytes.write_u16::<LittleEndian>(*a1).map_err(|e| e.to_string())?;
+                }
+                ProtocolData::Servo { s0, s1 , update_flag} => {
+                    bytes.write_u16::<LittleEndian>(*s0).map_err(|e| e.to_string())?;
+                    bytes.write_u16::<LittleEndian>(*s1).map_err(|e| e.to_string())?;
+                    bytes.write_u16::<LittleEndian>(*s1).map_err(|e|e.to_string())?;
+                    bytes.push(*update_flag);
+                }
+                ProtocolData::Led{ sys, stat, update_flag} =>{
+                    bytes.push(*sys);
+                    bytes.push(*stat);
+                    bytes.push(*update_flag);
+                }
+                ProtocolData::Motor(motor) => {
+                    bytes.extend(motor.to_bytes());
+                }
+                ProtocolData::FOC {
+                    foc_1,
+                    foc_2,
+                    foc_3,
+                    en,
+                } => {
+                    bytes.push(*foc_1);
+                    bytes.push(*foc_2);
+                    bytes.push(*foc_3);
+                    bytes.push(*en);
+                }
+                ProtocolData::StreamStart { stream_target, stream_length, flags } => {
+                    bytes.push(*stream_target);
+                    bytes.write_u16::<LittleEndian>(*stream_length).map_err(|e| e.to_string())?;
+                    bytes.push(*flags);
+                }
+                ProtocolData::StreamFragment { sequence, data } => {
+                    bytes.push(*sequence);
+                    bytes.extend(data);
+                },
+                ProtocolData::RevokeConfig { device_id } => {
+                    bytes.push(*device_id);
+                },
+                ProtocolData::Error { code, message } => {
+                    bytes.push(*code);
+                    bytes.write_u32::<LittleEndian>(*message).map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(bytes)
+        }
         match self {
             CanDriveMessage::DiscoveryReq {
                 serial,
                 previous_id,
             } => {
-                bytes.write_u32::<LittleEndian>(*serial);
+                bytes.write_u32::<LittleEndian>(*serial).map_err(|e| e.to_string())?;
                 bytes.push(*previous_id);
             }
             CanDriveMessage::DiscoveryAssign {
                 serial,
                 assigned_id,
             } => {
-                bytes.write_u32::<LittleEndian>(*serial);
+                bytes.write_u32::<LittleEndian>(*serial).map_err(|e| e.to_string())?;
                 bytes.push(*assigned_id);
             }
             CanDriveMessage::Control { id:_, is_controller,cmd, data } => {
                 let cmd_byte = cmd.to_u8() | (if *is_controller { 0x80 } else { 0x00 });
                 bytes.push(cmd_byte);
-                match data {
-                    ProtocolData::Empty => {}
-                    ProtocolData::Info {
-                        serial,
-                        fw_version,
-                        hw_version,
-                    } => {
-                        bytes.write_u32::<LittleEndian>(*serial);
-                        bytes.push(*fw_version);
-                        bytes.push(*hw_version);
-                    }
-                    ProtocolData::Position { value } => {
-                        bytes.write_u16::<LittleEndian>(*value);
-                    }
-                    ProtocolData::Status(status) => {
-                        bytes.extend(status.to_bytes());
-                    }
-                    ProtocolData::Analog { a0, a1 } => {
-                        bytes.write_u16::<LittleEndian>(*a0);
-                        bytes.write_u16::<LittleEndian>(*a1);
-                    }
-                    ProtocolData::Servo { s0, s1 , update_flag} => {
-                        bytes.write_u16::<LittleEndian>(*s0);
-                        bytes.write_u16::<LittleEndian>(*s1);
-                        bytes.push(*update_flag);
-                    }
-                    ProtocolData::Led{ sys, stat, update_flag} =>{
-                        bytes.push(*sys);
-                        bytes.push(*stat);
-                        bytes.push(*update_flag);
-                    }
-                    ProtocolData::Motor(motor) => {
-                        bytes.extend(motor.to_bytes());
-                    }
-                    ProtocolData::FOC {
-                        foc_1,
-                        foc_2,
-                        foc_3,
-                        en,
-                    } => {
-                        bytes.push(*foc_1);
-                        bytes.push(*foc_2);
-                        bytes.push(*foc_3);
-                        bytes.push(*en);
-                    }
-                    ProtocolData::StreamFragment { sequence, data } => {
-                        bytes.push(*sequence);
-                        bytes.extend(data);
-                    },
-                    ProtocolData::Error { code, message } => {
-                        bytes.push(*code);
-                        bytes.write_u32::<LittleEndian>(*message);
-                    }
-                }
+                bytes.extend(handle_protocol_data(data)?);
+            }
+            CanDriveMessage::Broadcast { cmd, data } => {
+                bytes.push(cmd.to_u8() | 0x80);
+                bytes.extend(handle_protocol_data(data)?);
             }
         }
-        return bytes;
+        return Ok(bytes);
     }
 
-    pub fn parse_can_frame(id: u16, bytes: &[u8]) -> Result<Option<CanDriveMessage>, &'static str> {
+    pub fn parse_can_frame(id: u16, bytes: &[u8]) -> Result<Option<CanDriveMessage>, String> {
         let cmd = bytes[0] & 0x7F;
-        let is_contorller = (bytes[0] & 0x80) == 0x80;
+        let is_controller = (bytes[0] & 0x80) == 0x80;
         let data = &bytes[1..];
         let msg: CanDriveMessage;
         if id == CONTROLLER_ID {
-            println!("Controller Message (ID: {:?})", bytes);
+            debug!("Controller Message (ID: {:?})", bytes);
             return Ok(None);
         }
         if id == DISCOVERY_REQUEST_ID {
-            print!("Discovery Req Message (ID: {:?})", bytes);
+            if bytes.len() < 5 {
+                return Err("Underflow discovery request message".to_string());
+            }
+            debug!("Discovery Request Message ({:?})", bytes);
             msg = CanDriveMessage::DiscoveryReq {
-                serial: LittleEndian::read_u32(&bytes[1..5]),
-                previous_id: bytes[5],
+                serial: LittleEndian::read_u32(&bytes[0..4]),
+                previous_id: bytes[4],
             };
             return Ok(Some(msg));
         }
         if id == DISCOVERY_ASSIGN_ID {
-            print!("Discovery Assign Message (ID: {:?})", bytes);
+            if bytes.len() < 5 {
+                return Err("Underflow discovery assign message".to_string());
+            }
+            debug!("Discovery Assign Message ({:?})", bytes);
             msg = CanDriveMessage::DiscoveryAssign {
-                serial: LittleEndian::read_u32(&bytes[1..5]),
-                assigned_id: bytes[5],
+                serial: LittleEndian::read_u32(&bytes[0..4]),
+                assigned_id: bytes[4],
             };
             return Ok(Some(msg));
         }
         if id < DEVICE_BASE_ID {
-            println!("Reserved Message (ID: {:?})", bytes);
+            debug!("Reserved Message ({:?})", bytes);
             return Ok(None);
         }
+        debug!("Control Message ({:?})", bytes);
         let device_id = DeviceId::from_can_id(id);
         use Commands::*;
         msg = CanDriveMessage::Control {
             id: device_id,
-            is_controller: is_contorller,
+            is_controller: is_controller,
             cmd: Commands::from_u8(cmd),
             data: match Commands::from_u8(cmd) {
-                GET_INFO => {
+                NOOP => ProtocolData::Empty,
+                GetInfo => {
                     if data.len() < 6 {
-                        return Err("Underflow device_info message");
+                        return Err("Underflow device_info message".to_string());
                     }
                     ProtocolData::Info {
                         serial: LittleEndian::read_u32(&data[0..4]),
-                        fw_version: data[4],
-                        hw_version: data[5],
+                        fw_major: data[4],
+                        fw_minor: data[5],
+                        fw_patch: data[6],
                     }
                 }
-                GET_POSITION => {
+                GetInfoExt => {
                     if data.len() < 2 {
-                        return Err("Underflow device_position message");
+                        return Err("Underflow device_info_ext message".to_string());
+                    }
+                    ProtocolData::InfoExt {
+                        flags: data[0],
+                        temperature: data[1],
+                    }
+                }
+                GetPosition => {
+                    if data.len() < 2 {
+                        return Err("Underflow device_position message".to_string());
                     }
                     ProtocolData::Position {
                         value: LittleEndian::read_u16(&data[0..2]),
                     }
                 }
-                GET_STATUS => {
-                    if data.len() < 1 {
-                        return Err("Underflow Device_status message");
+                SetPosition => {
+                    if data.len() < 2 {
+                        return Err("Underflow device_set_position message".to_string());
                     }
-                    ProtocolData::Status(StatusBits::from_bytes(&data[0..2])?)
+                    ProtocolData::Position {
+                        value: LittleEndian::read_u16(&data[0..2]),
+                    }
                 }
-                GET_ANALOG => {
+                GetStatus => {
+                    if data.len() < 1 {
+                        return Err("Underflow Device_status message".to_string());
+                    }
+                    ProtocolData::Status(StatusBits::from_bytes(&data[0..1])?)
+                }
+                GetAnalog => {
                     if data.len() < 4 {
-                        return Err("Underflow device_analog message");
+                        return Err("Underflow device_analog message".to_string());
                     }
                     ProtocolData::Analog {
                         a0: LittleEndian::read_u16(&data[0..2]),
                         a1: LittleEndian::read_u16(&data[2..4]),
                     }
                 }
-                GET_SERVO => {
+                SetServo => {ProtocolData::Empty},
+                GetServo => {
                     if data.len() < 4 {
-                        return Err("Underflow device_servo message");
+                        return Err("Underflow device_servo message".to_string());
                     }
                     ProtocolData::Servo {
                         s0: LittleEndian::read_u16(&data[0..2]),
@@ -450,9 +536,9 @@ impl CanDriveMessage {
                         update_flag: data[4],
                     }
                 }
-                SET_LED => {
+                SetLed => {
                     if data.len() < 3 {
-                        return Err("Underflow device_set_led message");
+                        return Err("Underflow device_set_led message".to_string());
                     }
                     ProtocolData::Led {
                         sys: data[0],
@@ -460,9 +546,9 @@ impl CanDriveMessage {
                         update_flag: data[2],
                     }
                 }
-                GET_LED => {
+                GetLed => {
                     if data.len() < 3 {
-                        return Err("Underflow device_led message");
+                        return Err("Underflow device_led message".to_string());
                     }
                     ProtocolData::Led {
                         sys: data[0],
@@ -470,15 +556,21 @@ impl CanDriveMessage {
                         update_flag: data[2],
                     }
                 }
-                GET_MOTOR => {
-                    if data.len() < 1 {
-                        return Err("Underflow device_motor message");
+                GetMotor => {
+                    if data.len() < 3 {
+                        return Err("Underflow device_motor message".to_string());
                     }
                     ProtocolData::Motor(MotorBits::from_bytes(&data[0..])?)
                 }
-                GET_FOC => {
+                SetMotor => {
+                    if data.len() < 3 {
+                        return Err("Underflow device_motor message".to_string());
+                    }
+                    ProtocolData::Motor(MotorBits::from_bytes(&data[0..])?)
+                }
+                GetFOC => {
                     if data.len() < 4 {
-                        return Err("Underflow device_foc message");
+                        return Err("Underflow device_foc message".to_string());
                     }
                     ProtocolData::FOC {
                         foc_1: data[0],
@@ -487,42 +579,68 @@ impl CanDriveMessage {
                         en: data[3],
                     }
                 }
-                STREAM_START => {
-                    if data.len() < 5 {
-                        return Err("Underflow device_stream_start message");
+                SetFOC => {
+                    if data.len() < 4 {
+                        return Err("Underflow device_foc message".to_string());
                     }
-                    let mut s_data = [0; 5];
-                    s_data.copy_from_slice(&data[1..6]);
+                    ProtocolData::FOC {
+                        foc_1: data[0],
+                        foc_2: data[1],
+                        foc_3: data[2],
+                        en: data[3],
+                    }
+                }
+                StreamStart => {
+                    if data.len() < 4 {
+                        return Err("Underflow device_stream_start message".to_string());
+                    }
+                    ProtocolData::StreamStart {
+                        stream_target: data[0],
+                        stream_length: LittleEndian::read_u16(&data[1..3]),
+                        flags: data[3],
+                    }
+                }
+                StreamData => {
+                    if data.len() < 4 {
+                        return Err("Underflow device_stream_data message".to_string());
+                    }
+                    let mut s_data = [0; 4];
+                    s_data.copy_from_slice(&bytes[1..5]);
                     ProtocolData::StreamFragment {
                         sequence: data[0],
                         data: s_data,
                     }
                 }
-                STREAM_DATA => {
+                Ack => ProtocolData::Empty,
+                StartFwUpdate => ProtocolData::Empty,
+                FWUpdate => ProtocolData::Empty,
+                RevokeConfig => ProtocolData::RevokeConfig {
+                    device_id: data[0],
+                },
+                NetworkReset => ProtocolData::Empty,
+                OverwriteUserStore => ProtocolData::Empty,
+                EraseUserStore => ProtocolData::Empty,
+                Error => {
                     if data.len() < 5 {
-                        return Err("Underflow device_stream_data message");
-                    }
-                    let mut s_data = [0; 5];
-                    s_data.copy_from_slice(&bytes[1..6]);
-                    ProtocolData::StreamFragment {
-                        sequence: data[0],
-                        data: s_data,
-                    }
-                }
-                ACK => ProtocolData::Empty,
-                FW_UPDATE => ProtocolData::Empty,
-                ERROR => {
-                    if data.len() < 5 {
-                        return Err("Underflow device_error message");
+                        return Err("Underflow device_error message".to_string());
                     }
                     ProtocolData::Error {
                         code: data[0],
                         message: LittleEndian::read_u32(&data[1..5]),
                     }
                 }
-                _ => return Err("Invalid command"),
+                Invalid => {
+                    return Err("Invalid command in CAN frame".to_string());
+                }
             },
         };
         Ok(Some(msg))
+    }
+
+    pub fn index(&self) -> u8 {
+         // SAFETY: Because `Self` is marked `repr(u8)`, its layout is a `repr(C)` `union`
+        // between `repr(C)` structs, each of which has the `u8` discriminant as its first
+        // field, so we can read the discriminant without offsetting the pointer.
+        unsafe { *<*const _>::from(self).cast::<u8>() }
     }
 }

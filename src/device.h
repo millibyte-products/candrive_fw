@@ -49,17 +49,34 @@
 #define MISC (PB0)
 
 #define PWMCHANNEL(x) STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(x)))
-#define INVALID_DEVICE (0)
+#define INVALID_DEVICE (-1)
 
-uint8_t get_device_id();
-void set_device_id(uint8_t value);
+typedef enum
+{
+    RESET_REASON_UNKNOWN = 0,
+    RESET_REASON_LOW_POWER_RESET,
+    RESET_REASON_WINDOW_WATCHDOG_RESET,
+    RESET_REASON_INDEPENDENT_WATCHDOG_RESET,
+    RESET_REASON_SOFTWARE_RESET,
+    RESET_REASON_POWER_ON_POWER_DOWN_RESET,
+    RESET_REASON_EXTERNAL_RESET_PIN_RESET,
+    RESET_REASON_BROWNOUT_RESET,
+} reset_reason_t;
+
+void init_device();
+int16_t get_device_id();
+void set_device_id(int16_t value);
 uint32_t get_serial_no();
-uint32_t get_fw_ver();
+uint8_t get_fw_major();
+uint8_t get_fw_minor();
+uint8_t get_fw_patch();
 // Seconds since epoch
 uint64_t get_build_ts();
 // 20 bytes for git sha1
-uint8_t* get_build_commit();
+const uint8_t* get_build_commit();
 uint8_t get_protocol_ver();
-uint32_t get_hw_ver();
+uint8_t get_hw_ver();
+reset_reason_t get_last_reset_reason(void);
+
 
 #endif // _DEVICE_H_

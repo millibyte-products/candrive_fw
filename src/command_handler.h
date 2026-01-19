@@ -12,24 +12,22 @@
 #define _TASK_STD_FUNCTION
 #define _TASK_SCHEDULING_OPTIONS
 
+#include <unordered_map>
+
 #include <TaskScheduler.h>
 
 #include <Arduino.h>
-#include <BLDCMotor.h>
-#include <drivers/BLDCDriver3PWM.h>
-#include <encoders/MT6701/MagneticSensorMT6701SSI.h>
-
-#include <drivers/hardware_specific/stm32/stm32_mcu.h>
 
 class CommandHandler;
 
 #include "device.h"
 #include "parser.h"
 #include "protocol.h"
-#include "kinematics.h"
 #include "serial_parser.h"
 #include "can_parser.h"
 #include "errors.h"
+#include "stream_handler.h"
+#include "motor.h"
 
 #define LED_DUTY_DEFAULT (25)
 #define FOC_PWM_FREQ (50000)
@@ -39,25 +37,28 @@ class CommandHandler
 private:
     HardwareTimer led_timer;
     HardwareTimer servo_timer;
-    MagneticSensorMT6701SSI encoder;
-    BLDCMotor motor;
-    BLDCDriver3PWM motor_driver;
-    KinematicsModel kinematics;
+    Motor motor;
     SerialParser serial_interface;
     CANParser can_interface;
     Scheduler ts;
     Task critical_task;
     Task standard_task;
     Task lazy_task;
+    Task discovery_task;
     bool sys_state;
     bool stat_state;
+    int16_t previous_device_id;
+    StreamHandler stream_handler;
+    std::unordered_map<int, uint16_t> servo_values;
 
-    void set_pwm(HardwareTimer* timer, int pin, uint32_t duty, uint32_t freq)
+    void set_pwm(HardwareTimer* timer, int pin, uint16_t duty, uint32_t freq)
     {
         if (timer)
         {
+
+            uint32_t computed_duty = ((uint32_t)duty * freq) / 65535;
             uint32_t channel = STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(pin), PinMap_PWM));
-            timer->setPWM(channel, pin, freq, duty);
+            timer->setPWM(channel, pin, freq, computed_duty);
         }
     }
 
@@ -65,8 +66,18 @@ private:
         set_pwm(&led_timer, pin, duty, LED_FREQ);
     }
 
-    void set_servo(int pin, uint32_t duty) {
+    void set_servo(int pin, uint16_t duty) {
+        servo_values[pin] = duty;
         set_pwm(&servo_timer, pin, duty, SERVO_FREQ);
+    }
+
+    void get_servo(int pin, uint16_t* duty) {
+        std::unordered_map<int, uint16_t>::iterator it = servo_values.find(pin);
+        if (it != servo_values.end()) {
+            *duty = it->second;
+        } else {
+            *duty = 0;
+        }
     }
 
     void handle_endstop0(void)
@@ -88,11 +99,7 @@ private:
 
     void update_critical()
     {
-        motor.loopFOC();
-        encoder.update();
-        float angle = encoder.getAngle();
-        float target_voltage = kinematics.calculate_voltage(angle);
-        motor.move(target_voltage);
+        motor.update();
     }
 
     void update_standard()
@@ -107,207 +114,274 @@ private:
         set_led(LED_SYS_PWM, sys_state ? LED_DUTY_DEFAULT : 0);
         set_led(LED_STAT_PWM, stat_state ? LED_DUTY_DEFAULT : 0);
     }
-    
-    void handle_discovery_message(discovery_message_t* msg, Parser* reply_to)
+
+    void update_discovery()
+    {
+        discovery_message_t discovery_message {
+            .serial_no = get_serial_no(),
+            .id_value = static_cast<uint8_t>(previous_device_id),
+        };
+        can_interface.start_frame();
+        can_interface.write_frame((uint8_t*)&discovery_message, sizeof(discovery_message_t));
+        can_interface.end_frame(DISCOVERY_REQUEST_ID);
+    }
+
+    void set_discovery_mode(bool enable, Parser* parser_instance)
+    {
+        if (enable)
+        {
+            discovery_task.enable();
+            set_device_id(INVALID_DEVICE);
+            if (parser_instance)
+            {
+                parser_instance->set_device_filter(DISCOVERY_ASSIGN_ID);
+            }
+        } else {
+            discovery_task.disable();
+            previous_device_id = get_device_id();
+            if (parser_instance)
+            {
+                parser_instance->set_device_filter(get_device_id() + DEVICE_BASE_ID);
+            }
+        }
+    }
+
+    int32_t handle_discovery_message(discovery_message_t* msg, Parser* reply_to)
     {
         if (msg && msg->serial_no == get_serial_no())
         {
-            set_device_id(msg->device_id);
-            uint8_t buffer[2] = {
-                msg->device_id,
-                DEVICE_ACK
-            };
+            set_device_id((int16_t)msg->id_value);
+            set_discovery_mode(false, reply_to);
             if (reply_to)
             {
-                reply_to->write(DEVICE_DISCOVERY, buffer, 2);
+                write_device_info(reply_to);
             }
         }
+        return PARSER_OK;
     }
 
-    void handle_device_message(device_message_t *msg, Parser* reply_to)
+    int32_t handle_device_message(uint8_t device_id, device_message_t *msg, Parser* reply_to)
     {
-        if (msg && msg->device_id == get_device_id())
+        if ((int16_t)device_id == get_device_id() && msg && (msg->command & COMMAND_CONTROLLER_MASK))
         {
-            switch(msg->cmd)
+            uint8_t command = msg->command & COMMAND_CMD_MASK;
+            switch(command)
             {
-                case CONTROLLER_GET_INFO:
-                {
-                    device_message_t reply {
-                        .device_id = get_device_id(),
-                        .cmd = DEVICE_INFO,
-                        .info_data = {
-                            .serial_no = get_serial_no(),
-                            .fw_ver = get_fw_ver(),
-                            .hw_ver = get_hw_ver(),
-                        },
-                    };
-                    if (reply_to)
+                case CMD_GET_INFO:
                     {
-                        reply_to->write(DEVICE_GENERAL, (uint8_t*)&reply, DEVICE_HEADER_SIZE + sizeof(device_info_t));
+                        write_device_info(reply_to);
                     }
-                }
-                break;
-                case CONTROLLER_SET_POSITION:
-                {
-                    kinematics.set_position_req(((float)msg->position_data.position) / 10000);
-                    device_message_t reply
+                    break;
+                case CMD_GET_INFO_EXT:
                     {
-                        .device_id = get_device_id(),
-                        .cmd = DEVICE_ACK,
-                    };
-                    if (reply_to)
-                    {
-                        reply_to->write(DEVICE_GENERAL, (uint8_t*)&reply, DEVICE_HEADER_SIZE);
+                        write_device_info_ext(reply_to);
                     }
-                }
-                break;
-                case CONTROLLER_GET_STATUS:
-                {
-                    device_message_t reply {
-                        .device_id = get_device_id(),
-                        .cmd = DEVICE_STATUS,
-                        .status_data = {
-                            .endstop0 = digitalRead(ENDSTOP0),
-                            .endstop1 = digitalRead(ENDSTOP1),
-                            .misc = digitalRead(MISC),
-                            .fault = digitalRead(M_NFAULT),
-                            .mag = 0, // we can't read this yet
-                        },
-                    };
-                    if (reply_to)
+                    break;
+                case CMD_SET_POSITION:
                     {
-                        reply_to->write(DEVICE_GENERAL, (uint8_t*)&reply, DEVICE_HEADER_SIZE + sizeof(device_status_t));
+                        uint16_t position = msg->data[1] | (msg->data[2] << 8);
+                        motor.request_angle(position);
+                        write_ack(reply_to);
                     }
-                }
-                break;
-                case CONTROLLER_GET_ANALOG:
-                {
-                    device_message_t reply {
-                        .device_id = get_device_id(),
-                        .cmd = DEVICE_ANALOG,
-                        .analog_data = {
-                            .a0 = analogRead(A0),
-                            .a1 = analogRead(A1),
-                        },
-                    };
-                    if (reply_to)
+                    break;
+                case CMD_GET_POSITION:
                     {
-                        reply_to->write(DEVICE_GENERAL, (uint8_t*)&reply, DEVICE_HEADER_SIZE + sizeof(device_analog_t));
+                        write_device_position(reply_to, (uint16_t)motor.get_angle() );
                     }
-                }
-                break;
-                case CONTROLLER_SET_SERVO:
-                {
-                    set_servo(SRV0_PWM, msg->servo_data.srv0);
-                    set_servo(SRV1_PWM, msg->servo_data.srv1);
-                    device_message_t reply {
-                        .device_id = get_device_id(),
-                        .cmd = DEVICE_ACK,
-                    };
-                    if (reply_to)
+                    break;
+                case CMD_GET_STATUS:
                     {
-                        reply_to->write(DEVICE_GENERAL, (uint8_t*)&reply, DEVICE_HEADER_SIZE);
+                        uint8_t flags =
+                                (0 ? digitalRead(ENDSTOP0) == LOW : 1) |
+                                (0 ? digitalRead(ENDSTOP1) == LOW : 1) << 1 |
+                                (0 ? digitalRead(MISC) == LOW : 1) << 2 |
+                                (0 ? digitalRead(M_NFAULT) == LOW : 1) << 3 |
+                                0 << 4;
+                        write_device_status(reply_to, flags);
                     }
-                }
-                break;
-                case CONTROLLER_SET_LED:
-                {
-                    lazy_task.disable();
-                    device_message_t reply {
-                        .device_id = get_device_id(),
-                        .cmd = DEVICE_ACK,
-                    };
-                    switch(msg->led_data.index)
+                    break;
+                case CMD_GET_ANALOG:
                     {
-                        case LED_STAT:
-                            set_led(LED_STAT_PWM, msg->led_data.value);
-                            break;
-                            set_led(LED_SYS_PWM, msg->led_data.value);
-                            break;
-                        default:
-                            reply.cmd = DEVICE_ERROR;
-                            reply.error_data.error_code = ERROR_INVALID_LED_INDEX;
-                            reply.error_data.error_message = msg->led_data.index;
-                            break;
+                        device_analog_t analog_data = {
+                            .a0 = static_cast<uint16_t>(analogRead(A0)),
+                            .a1 = static_cast<uint16_t>(analogRead(A1)),
+                        };
+                        write_device_analog(reply_to, &analog_data);
                     }
-                    if (reply_to)
+                    break;
+                case CMD_SET_SERVO:
                     {
-                        reply_to->write(DEVICE_GENERAL, (uint8_t*)&reply, DEVICE_HEADER_SIZE);
+                        uint16_t srv0 = msg->data[1] | (msg->data[2] << 8);
+                        uint16_t srv1 = msg->data[3] | (msg->data[4] << 8);
+                        set_servo(SRV0_PWM, srv0);
+                        set_servo(SRV1_PWM, srv1);
+                        write_ack(reply_to);
                     }
-                }
-                break;
-                case CONTROLLER_SET_MOTOR:
-                {
-                    // TODO override torque?
-                    digitalWrite(M_NRST, msg->motor_data.rst);
-                    digitalWrite(M_NSLEEP, msg->motor_data.sleep);
-                    device_message_t reply {
-                        .device_id = get_device_id(),
-                        .cmd = DEVICE_ACK,
-                    };
-                    if (reply_to)
+                    break;
+                case CMD_GET_SERVO:
                     {
-                        reply_to->write(DEVICE_GENERAL, (uint8_t*)&reply, DEVICE_HEADER_SIZE);
+
+                        device_servo_t servo_data;
+                        get_servo(SRV0_PWM, &servo_data.srv0);
+                        get_servo(SRV1_PWM, &servo_data.srv1);
+                        write_device_servo(reply_to, &servo_data);
                     }
-                }
-                break;
-                case CONTROLLER_SET_FOC:
-                {
-                    // TODO direct foc/pwm control
-                }
-                break;
-                case CONTROLLER_STREAM_START:
-                {
-                    // TODO direct stream
-                }
-                break;
-                case CONTROLLER_STREAM_DATA:
-                {
-                    // TODO direct stream
-                }
-                break;
-                case CONTROLLER_ACK:
-                {
-                    // No need to respond
-                }
-                break;
-                case CONTROLLER_START_FW_UPDATE:
-                {
-                    // TODO fw update via stream
-                }
-                break;
+                    break;
+                case CMD_SET_LED:
+                    {
+                        lazy_task.disable();
+                        uint8_t sys = msg->data[1];
+                        uint8_t stat = msg->data[2];
+                        uint8_t update_mask = msg->data[3];
+                        if (update_mask & LED_STAT)
+                        {
+                            set_led(LED_STAT_PWM, stat);
+                        }
+                        if (update_mask & LED_SYS)
+                        {
+                            set_led(LED_SYS_PWM, sys);
+                        }
+                        write_ack(reply_to);
+                    }
+                    break;
+                case CMD_SET_MOTOR:
+                    {
+                        // TODO override torque?
+                        uint8_t flags = msg->data[1];
+                        digitalWrite(M_NRST, flags & MOTOR_RST_MASK);
+                        digitalWrite(M_NSLEEP, flags & MOTOR_SLEEP_MASK);
+                        write_ack(reply_to);
+                    }
+                    break;
+                case CMD_GET_MOTOR:
+                    {
+                        device_motor_t motor_data = {
+                            .value = 0,
+                            .flags = 0,
+                        };
+                        write_device_motor(reply_to, &motor_data);
+                    }
+                    break;
+                case CMD_SET_FOC:
+                    {
+                        // TODO direct foc/pwm control
+                        error_data_t error_data = {
+                            .error_code = ERROR_NOT_IMPLEMENTED,
+                            .error_message = 0,
+                        };
+                        write_device_error(reply_to, &error_data);
+                    }
+                    break;
+                case CMD_STREAM_START:
+                    {
+                        uint8_t stream_target = msg->data[1];
+                        uint32_t stream_length = msg->data[2] | (msg->data[3] << 8) | (msg->data[4] << 16) | (msg->data[5] << 24);
+                        uint8_t flags = msg->data[6];
+                        stream_handler.handle_stream_start(stream_target, stream_length, flags, reply_to);
+                    }
+                    break;
+                case CMD_STREAM_DATA:
+                    {
+                        uint8_t sequence_id = msg->data[1];
+                        uint8_t data[4] = {
+                            msg->data[2],
+                            msg->data[3],
+                            msg->data[4],
+                            msg->data[5],
+                        };
+                        stream_handler.handle_stream_data(sequence_id, data, 4, reply_to);
+                    }
+                    break;
+                case CMD_ACK:
+                    {
+                        // No need to respond
+                    }
+                    break;
+                case CMD_START_FW_UPDATE:
+                    {
+                        // TODO fw update via stream
+                        error_data_t error_data = {
+                            .error_code = ERROR_NOT_IMPLEMENTED,
+                            .error_message = 0,
+                        };
+                        write_device_error(reply_to, &error_data);
+                    }
+                    break;
+                case CMD_NETWORK_RESET:
+                    {
+                        // TODO reset network
+                        set_device_id(INVALID_DEVICE);
+                        set_discovery_mode(true, reply_to);
+                    }
+                    break;
+                case CMD_ERASE_USER_STORE:
+                    break;
+                case CMD_OVERWRITE_USER_STORE:
+                    break;
+                case CMD_REVOKE_CONFIG:
+                    {
+                        set_device_id(INVALID_DEVICE);
+                        set_discovery_mode(true, reply_to);
+                    }
+                    break;
                 default:
+                    return PARSER_ERROR;
                     break;
             }
         }
+        return PARSER_OK;
+    }
+
+    int32_t handle_broadcast_message(device_message_t* msg, Parser* reply_to)
+    {
+        switch (msg->command)
+        {
+            case CMD_NETWORK_RESET:
+            {
+                set_device_id(INVALID_DEVICE);
+                set_discovery_mode(true, reply_to); // TODO: reply_to is not used
+            }
+        }
+        return PARSER_OK;
     }
 
 public:
-    CommandHandler() : 
-        encoder(ENCODER_CSN),
-        motor(11, 5.05f/2.0),
-        motor_driver(FOC_IN1_PWM, FOC_IN2_PWM, FOC_IN3_PWM, FOC_EN),
-        led_timer(TIM3), 
+    CommandHandler() : led_timer(TIM3),
         servo_timer(TIM4),
-        critical_task(3 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_critical, this), &ts, true),
-        standard_task(10 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_standard, this), &ts, true),
-        lazy_task(250 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_lazy, this), &ts, true),
         serial_interface(std::bind(&CommandHandler::handle_device_message,
                                     this,
                                     std::placeholders::_1,
-                                    std::placeholders::_2),
+                                    std::placeholders::_2,
+                                    std::placeholders::_3),
                          std::bind(&CommandHandler::handle_discovery_message,
                                     this,
                                     std::placeholders::_1,
-                                    std::placeholders::_2)),
+                                    std::placeholders::_2),
+                        std::bind(&CommandHandler::handle_broadcast_message,
+                                this,
+                                std::placeholders::_1,
+                                std::placeholders::_2)),
         can_interface(std::bind(&CommandHandler::handle_device_message,
                                 this,
                                 std::placeholders::_1,
-                                std::placeholders::_2),
+                                std::placeholders::_2,
+                                std::placeholders::_3),
                       std::bind(&CommandHandler::handle_discovery_message,
                                 this,
                                 std::placeholders::_1,
-                                std::placeholders::_2))
+                                std::placeholders::_2),
+                      std::bind(&CommandHandler::handle_broadcast_message,
+                                this,
+                                std::placeholders::_1,
+                                std::placeholders::_2)),
+        ts(),
+        critical_task(3 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_critical, this), &ts, true),
+        standard_task(10 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_standard, this), &ts, true),
+        lazy_task(250 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_lazy, this), &ts, true),
+        discovery_task(20000 * TASK_MILLISECOND, -1, std::bind(&CommandHandler::update_discovery, this), &ts, true),
+        sys_state(false),
+        stat_state(false),
+        previous_device_id(0) // TOOD: load from non-volatile storage
     {
         // put your setup code here, to run once:
         pinMode(ENDSTOP0, INPUT_PULLUP);
@@ -329,40 +403,19 @@ public:
         attachInterrupt(digitalPinToInterrupt(ENDSTOP1), std::bind(&CommandHandler::handle_endstop1, this), FALLING);
         attachInterrupt(digitalPinToInterrupt(M_NFAULT), std::bind(&CommandHandler::handle_motor_fault, this), FALLING);
 
-        // Enable motor
-        digitalWrite(M_NSLEEP, HIGH);
-        // Disable motor sleep 
-        digitalWrite(M_NRST, HIGH);
-        SPI.setMOSI(PA7);
-        SPI.setMISO(PA6);
-        SPI.setSCLK(PA5);
-        SPI.setSSEL(PA4);
-        SPI.begin();
-        encoder.init(&SPI);
-        motor_driver.voltage_power_supply = MOTOR_SUPPLY_VOLTAGE;
-        motor_driver.voltage_limit = MOTOR_OPERATING_VOLTAGE;
-        motor_driver.pwm_frequency = FOC_PWM_FREQ;
-        motor_driver.init();
-        motor.current_limit = MOTOR_CURRENT_LIMIT;
-        motor.torque_controller = TorqueControlType::voltage;
-        motor.controller = MotionControlType::torque;
-        motor.linkSensor(&encoder);
-        motor.linkDriver(&motor_driver);
         motor.init();
-        motor.useMonitoring(Serial3);
-        motor.voltage_sensor_align = MOTOR_OPERATING_VOLTAGE;
-        motor.initFOC();
-        encoder.update();
-        kinematics.set_zero(encoder.getSensorAngle());
         critical_task.setSchedulingOption(TASK_SCHEDULE_NC);
         lazy_task.setSchedulingOption(TASK_INTERVAL);
+        discovery_task.setSchedulingOption(TASK_INTERVAL);
         standard_task.setSchedulingOption(TASK_SCHEDULE_NC);
         critical_task.enable();
         standard_task.enable();
         lazy_task.enable();
-    
+
         sys_state = true;
         stat_state = false;
+
+        set_discovery_mode(true, nullptr);
     }
 
     void run()

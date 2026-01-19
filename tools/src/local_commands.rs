@@ -2,17 +2,23 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::{hash::Hash, io::BufRead};
 use std::thread::JoinHandle;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, unbounded};
+use strum_macros::{EnumDiscriminants, EnumIter};
 
-use crate::protocol::{CanDriveMessage, Commands, DeviceId, ProtocolData};
-use crate::util::Threaded;
+use crate::protocol::{ DeviceId };
+use crate::util::{Threaded, critical_error, is_running, set_running};
+use log::{error, info, trace};
 
-#[derive(Clone, Debug, Default)]
+#[repr(u8)]
+#[derive(Clone, Debug, Default, EnumDiscriminants)]
+#[strum_discriminants(derive(EnumIter))]
+#[strum_discriminants(name(LocalCommandTypes))]
 pub enum LocalCommands {
     #[default]
     ListDevices, // Dump local device cache to stdout
     ResetNetwork, // Broadcast network reset (devices start discovery again)
     SetPosition(DeviceId, u16),
+    GetPosition(DeviceId),
     GetInfo(DeviceId),
     GetStatus(DeviceId),
     SetSysLed(DeviceId, u8),
@@ -24,69 +30,66 @@ pub enum LocalCommands {
     SetServo0(DeviceId, u16),
     SetServo1(DeviceId, u16),
     UpdateFirmware(DeviceId, String),
+    RevokeConfig(DeviceId),
+    Help,
     Exit,
 }
 
 impl Hash for LocalCommands {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u8(self.index());
         match self {
-            LocalCommands::ListDevices => state.write_u8(1),
-            LocalCommands::ResetNetwork => state.write_u8(2),
             LocalCommands::SetPosition(id, pos) => {
-                state.write_u8(3);
                 state.write_u16(id.to_can_id());
                 state.write_u16(*pos);
             },
+            LocalCommands::GetPosition(id) => {
+                state.write_u16(id.to_can_id());
+            },
             LocalCommands::GetInfo(id) => {
-                state.write_u8(4);
                 state.write_u16(id.to_can_id());
             },
             LocalCommands::GetStatus(id) => {
-                state.write_u8(5);
                 state.write_u16(id.to_can_id());
             },
             LocalCommands::SetSysLed(id, v) => {
-                state.write_u8(6);
                 state.write_u16(id.to_can_id());
                 state.write_u8(*v);
             },
             LocalCommands::SetStatLed(id, v) => {
-                state.write_u8(7);
                 state.write_u16(id.to_can_id());
                 state.write_u8(*v);
             },
             LocalCommands::GetLeds(id) => {
-                state.write_u8(8);
                 state.write_u16(id.to_can_id());
             },
             LocalCommands::GetMotor(id) => {
-                state.write_u8(9);
                 state.write_u16(id.to_can_id());
             },
             LocalCommands::GetAnalog(id) => {
-                state.write_u8(10);
                 state.write_u16(id.to_can_id());
             },
             LocalCommands::GetServo(id) => {
-                state.write_u8(11);
                 state.write_u16(id.to_can_id());
             },
             LocalCommands::SetServo0(id, pos) => {
-                state.write_u8(12);
                 state.write_u16(id.to_can_id());
                 state.write_u16(*pos);
             },
             LocalCommands::SetServo1(id, pos) => {
-                state.write_u8(13);
                 state.write_u16(id.to_can_id());
                 state.write_u16(*pos);
             },
             LocalCommands::UpdateFirmware(id, path) => {
-                state.write_u8(14);
                 state.write_u16(id.to_can_id());
                 state.write(path.as_bytes());
             },
+            LocalCommands::RevokeConfig(id) => {
+                state.write_u16(id.to_can_id());
+            },
+            LocalCommands::Help => state.write_u8(16),
             LocalCommands::Exit => state.write_u8(15),
+            _ => (),
         }
     }
 }
@@ -97,6 +100,7 @@ impl PartialEq for LocalCommands {
             (LocalCommands::ListDevices, LocalCommands::ListDevices) => true,
             (LocalCommands::ResetNetwork, LocalCommands::ResetNetwork) => true,
             (LocalCommands::SetPosition(id1, pos1), LocalCommands::SetPosition(id2, pos2)) => id1 == id2 && pos1 == pos2,
+            (LocalCommands::GetPosition(id1), LocalCommands::GetPosition(id2)) => id1 == id2,
             (LocalCommands::GetInfo(id1), LocalCommands::GetInfo(id2)) => id1 == id2,
             (LocalCommands::GetStatus(id1), LocalCommands::GetStatus(id2)) => id1 == id2,
             (LocalCommands::SetSysLed(id1, state1), LocalCommands::SetSysLed(id2, state2)) => id1 == id2 && state1 == state2,
@@ -108,6 +112,8 @@ impl PartialEq for LocalCommands {
             (LocalCommands::SetServo0(id1, pos1), LocalCommands::SetServo0(id2, pos2)) => id1 == id2 && pos1 == pos2,
             (LocalCommands::SetServo1(id1, pos1), LocalCommands::SetServo1(id2, pos2)) => id1 == id2 && pos1 == pos2,
             (LocalCommands::UpdateFirmware(id1, path1), LocalCommands::UpdateFirmware(id2, path2)) => id1 == id2 && path1 == path2,
+            (LocalCommands::RevokeConfig(id1), LocalCommands::RevokeConfig(id2)) => id1 == id2,
+            (LocalCommands::Help, LocalCommands::Help) => true,
             (LocalCommands::Exit, LocalCommands::Exit) => true,
             _ => false,
         }
@@ -121,18 +127,21 @@ impl Display for LocalCommands {
         match self {
             LocalCommands::ListDevices => write!(f, "list"),
             LocalCommands::ResetNetwork => write!(f, "reset_network"),
-            LocalCommands::SetPosition(id, pos) => write!(f, "set_position {} {}", id, pos),
-            LocalCommands::GetInfo(id) => write!(f, "get_info {}", id),
-            LocalCommands::GetStatus(id) => write!(f, "get_status {}", id),
-            LocalCommands::SetSysLed(id, state) => write!(f, "set_sys_led {} {}", id, state),
-            LocalCommands::SetStatLed(id, state) => write!(f, "set_stat_led {} {}", id, state),
-            LocalCommands::GetLeds(id) => write!(f, "get_led {}", id),
-            LocalCommands::GetMotor(id) => write!(f, "get_motor {}", id),
-            LocalCommands::GetAnalog(id) => write!(f, "get_analog {}", id),
-            LocalCommands::GetServo(id) => write!(f, "get_servo {}", id),
-            LocalCommands::SetServo0(id, pos) => write!(f, "set_servo0 {} {}", id, pos),
-            LocalCommands::SetServo1(id, pos) => write!(f, "set_servo1 {} {}", id, pos),
-            LocalCommands::UpdateFirmware(id, path) => write!(f, "update_firmware {} {}", id, path),
+            LocalCommands::SetPosition(id, pos) => write!(f, "set_position {:X} {}", id, pos),
+            LocalCommands::GetPosition(id) => write!(f, "get_position {:X}", id),
+            LocalCommands::GetInfo(id) => write!(f, "get_info {:X}", id),
+            LocalCommands::GetStatus(id) => write!(f, "get_status {:X}", id),
+            LocalCommands::SetSysLed(id, state) => write!(f, "set_sys_led {:X} {}", id, state),
+            LocalCommands::SetStatLed(id, state) => write!(f, "set_stat_led {:X} {}", id, state),
+            LocalCommands::GetLeds(id) => write!(f, "get_led {:X}", id),
+            LocalCommands::GetMotor(id) => write!(f, "get_motor {:X}", id),
+            LocalCommands::GetAnalog(id) => write!(f, "get_analog {:X}", id),
+            LocalCommands::GetServo(id) => write!(f, "get_servo {:X}", id),
+            LocalCommands::SetServo0(id, pos) => write!(f, "set_servo0 {:X} {}", id, pos),
+            LocalCommands::SetServo1(id, pos) => write!(f, "set_servo1 {:X} {}", id, pos),
+            LocalCommands::UpdateFirmware(id, path) => write!(f, "update_firmware {:X} {}", id, path),
+            LocalCommands::RevokeConfig(id) => write!(f, "revoke_config {:X}", id),
+            LocalCommands::Help => write!(f, "help"),
             LocalCommands::Exit => write!(f, "exit"),
         }
     }
@@ -142,81 +151,88 @@ impl FromStr for LocalCommands {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+        let mut args = s.split_whitespace();
+        match args.next().ok_or("Missing command")? {
             "list" => Ok(LocalCommands::ListDevices),
             "reset_network" => Ok(LocalCommands::ResetNetwork),
             "set_position" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 let pos = args.next().ok_or("Missing position")?.parse::<u16>().map_err(|e| e.to_string())?;
                 Ok(LocalCommands::SetPosition(id, pos))
             },
+            "get_position" => {
+                let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
+                Ok(LocalCommands::GetPosition(id))
+            },
             "get_info" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 Ok(LocalCommands::GetInfo(id))
             },
             "get_status" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 Ok(LocalCommands::GetStatus(id))
             },
             "set_sys_led" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 let state = args.next().ok_or("Missing state")?.parse::<u8>().map_err(|e| e.to_string())?;
                 Ok(LocalCommands::SetSysLed(id, state))
             },
             "set_stat_led" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 let state = args.next().ok_or("Missing state")?.parse::<u8>().map_err(|e| e.to_string())?;
                 Ok(LocalCommands::SetStatLed(id, state))
             },
             "get_led" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 Ok(LocalCommands::GetLeds(id))
             },
             "get_motor" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 Ok(LocalCommands::GetMotor(id))
             },
             "get_analog" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 Ok(LocalCommands::GetAnalog(id))
             },
             "get_servo" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 Ok(LocalCommands::GetServo(id))
             },
             "set_servo0" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 let pos = args.next().ok_or("Missing position")?.parse::<u16>().map_err(|e| e.to_string())?;
                 Ok(LocalCommands::SetServo0(id, pos))
             },
             "set_servo1" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 let pos = args.next().ok_or("Missing position")?.parse::<u16>().map_err(|e| e.to_string())?;
                 Ok(LocalCommands::SetServo1(id, pos))
             },
             "update_firmware" => {
-                let mut args = s.split_whitespace();
                 let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
                 let path = args.next().ok_or("Missing path")?.to_string();
                 Ok(LocalCommands::UpdateFirmware(id, path))
             },
+            "revoke_config" => {
+                let id = DeviceId::from_str(args.next().ok_or("Missing device id")?)?;
+                Ok(LocalCommands::RevokeConfig(id))
+            },
+            "help" => Ok(LocalCommands::Help),
             "exit" => Ok(LocalCommands::Exit),
             _ => Err("Unknown command".to_string()),
         }
     }
 }
 
+
+impl LocalCommands {
+    pub fn index(&self) -> u8 {
+         // SAFETY: Because `Self` is marked `repr(u8)`, its layout is a `repr(C)` `union`
+        // between `repr(C)` structs, each of which has the `u8` discriminant as its first
+        // field, so we can read the discriminant without offsetting the pointer.
+        unsafe { *<*const _>::from(self).cast::<u8>() }
+    }
+}
 
 pub struct LocalCommandParser
 {
@@ -228,35 +244,40 @@ impl LocalCommandParser
 {
     pub fn new() -> Self
     {
+        trace!("Starting local command parser");
         let (tx, rx) = unbounded();
         let th = std::thread::spawn(move ||
         {
+            trace!("local command parser thread entered");
             let mut stdin = std::io::stdin().lock();
             let mut buffer = String::new();
-            loop {
+            while is_running() {
+                info!("Enter command>");
                 match stdin.read_line(&mut buffer)
                 {
                     Ok(byte_count) => {
                         if byte_count > 0 {
+                            trace!("Received input: {}", buffer);
                             match LocalCommands::from_str(&buffer)
                             {
                                 Ok(cmd) => {
+                                    info!("Parsed command: {:?}", cmd);
                                     match tx.send(cmd) {
                                         Ok(_) => (),
                                         Err(e) => {
-                                            eprintln!("Error sending to stdin queue: {}", e);
+                                            critical_error(format!("Error sending to stdin queue: {}", e));
                                             break;
                                         }
                                     }
                                 }
-                                Err(e) => eprintln!("Error parsing command: {}", e),
+                                Err(e) => error!("Error parsing command: {}", e),
                             };
                         } else {
                             return; // EOF
                         }
                     },
                     Err(e) => {
-                        eprintln!("Error reading from stdin: {}", e);
+                        critical_error(format!("Error reading from stdin: {}", e));
                         break;
                     }
                 }
@@ -273,148 +294,37 @@ impl LocalCommandParser
         return self.line_queue.clone();
     }
 
-    pub fn default_handler(&self, message: LocalCommands, can_tx: &Sender<CanDriveMessage>) -> Result<(), String>
+    pub fn default_handler(&self, message: LocalCommands) -> Result<(), String>
     {
         // Handle command
-        println!("Local command: {}", message);
+        trace!("Invoked Default Message Handler: Local command: {}", message);
         match message {
+            LocalCommands::Help => {
+                info!("Available commands:");
+                info!("  list");
+                info!("  reset_network");
+                info!("  set_position <device_id> <position>");
+                info!("  get_position <device_id>");
+                info!("  get_info <device_id>");
+                info!("  get_status <device_id>");
+                info!("  set_sys_led <device_id> <state>");
+                info!("  set_stat_led <device_id> <state>");
+                info!("  get_led <device_id>");
+                info!("  get_motor <device_id>");
+                info!("  get_analog <device_id>");
+                info!("  get_servo <device_id>");
+                info!("  set_servo0 <device_id> <position>");
+                info!("  set_servo1 <device_id> <position>");
+                info!("  update_firmware <device_id> <path>");
+                info!("  revoke_config <device_id>");
+                info!("  exit");
+                Ok(())
+            },
             LocalCommands::Exit => {
-                println!("Unhandeled exit command");
+                set_running(false);
                 Ok(())
             },
-            LocalCommands::ResetNetwork => {
-                println!("Broadcasting network reset...");
-                can_tx.send(
-                    CanDriveMessage::Control {
-                        id: DeviceId::new(0),
-                        is_controller: true,
-                        cmd: Commands::NETWORK_RESET,
-                        data: ProtocolData::Empty,
-                    })
-                    .map_err(|e| { format!("{}", e) })
-            },
-            LocalCommands::ListDevices => {
-                println!("Unhandled list command");
-                Ok(())
-            },
-            LocalCommands::SetPosition(id, pos) => {
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::SET_POSITION,
-                    data: ProtocolData::Position{ value: pos}
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::GetInfo(id) => {
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::GET_INFO,
-                    data: ProtocolData::Empty
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::GetStatus(id) => {
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::GET_STATUS,
-                    data: ProtocolData::Empty
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::SetSysLed(id, value) => {
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::SET_LED,
-                    data: ProtocolData::Led {
-                        sys: value,
-                        stat: 0,
-                        update_flag: 0x01
-                    }
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::SetStatLed(id, value) => {
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::SET_LED,
-                    data: ProtocolData::Led {
-                        sys: 0,
-                        stat: value,
-                        update_flag: 0x02
-                    }
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            }
-            LocalCommands::GetLeds(id) => {
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::GET_LED,
-                    data: ProtocolData::Empty
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::GetMotor(id) => {
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::GET_MOTOR,
-                    data: ProtocolData::Empty
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::GetAnalog(id) => {
-
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::GET_ANALOG,
-                    data: ProtocolData::Empty
-                };
-
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::GetServo(id) => {
-
-                let msg = CanDriveMessage::Control{
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::GET_SERVO,
-                    data: ProtocolData::Empty
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::SetServo0(id, pos) => {
-                // Send command to device via comm_manager
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::SET_SERVO,
-                    data: ProtocolData::Servo { s0: pos, s1: 0, update_flag: 0x01 }
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::SetServo1(id, pos) => {
-                // Send command to device via comm_manager
-                let msg = CanDriveMessage::Control {
-                    id: id,
-                    is_controller: true,
-                    cmd: Commands::SET_SERVO,
-                    data: ProtocolData::Servo { s0: 0, s1: pos, update_flag: 0x02 }
-                };
-                can_tx.send(msg).map_err(|e| format!("{}", e))
-            },
-            LocalCommands::UpdateFirmware(_id, _path) => {
-                Err("Update not implemented yet".to_string())
-            },
-            _ => {
-                Err("Command not implemented yet".to_string())
-            }
+            _ => Ok(())
         }
     }
 }

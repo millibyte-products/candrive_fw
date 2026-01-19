@@ -10,20 +10,36 @@
  */
 
 #include <STM32_CAN.h>
+#include "protocol.h"
 #include "parser.h"
 #include "command_handler.h"
+
+#define CAN_FRAME_MAX_DATA_LENGTH (8)
 
 class CANParser : public Parser
 {
 private:
     STM32_CAN instance;
+
+    void set_filter(uint8_t message_channel)
+    {
+        // Always listen to control messages on channel 0
+        instance.setFilterDualID(0, CONTROL_ID, message_channel, STD, STD);
+        // Dynamically set between discovery and device message channels
+        instance.setFilter(0, true);
+    }
 public:
-    CANParser(dev_handler_t dev, dis_handler_t dis, CAN_TypeDef*can = CAN1) : Parser(dev, dis), instance(can)
+    CANParser(dev_handler_t dev, dis_handler_t dis, bro_handler_t bro, CAN_TypeDef* can = CAN1) : Parser(dev, dis, bro), instance(can)
     {
         instance.setBaudRate(1000000);
         instance.begin();
         // Filter for controller messages
-        instance.setFilterDualID(0, CONTROLLER_ID, CONTROLLER_DISCOVERY, STD, STD);
+        set_filter(DISCOVERY_ASSIGN_ID);
+    }
+
+    void set_device_filter(int16_t device_id) override
+    {
+        set_filter((uint8_t)device_id);
     }
 
     void read() override
@@ -33,26 +49,31 @@ public:
         {
             switch (can_msg.id)
             {
-                case CONTROLLER_ID:
-                {
-                    device_message_t dmsg;
-                    memcpy(&dmsg, can_msg.buf, can_msg.len);
-                    dev_handler(&dmsg, this);
-                }
-                    break;
-                case CONTROLLER_DISCOVERY:
-                {
-                    discovery_message_t dmsg;
-                    if (can_msg.len != sizeof(discovery_message_t))
+                case DISCOVERY_ASSIGN_ID:
                     {
-                        // Abort, discarding message
-                        return;
+                        discovery_message_t dmsg;
+                        memcpy(&dmsg, can_msg.buf, can_msg.len);
+                        if (dis_handler(&dmsg, this) == PARSER_OK)
+                        {
+                            // Start listening to device messages on our channel
+                            set_filter(get_device_id() + DEVICE_BASE_ID);
+                        }
                     }
-                    memcpy(&dmsg, can_msg.buf, sizeof(discovery_message_t));
-                    dis_handler(&dmsg, this);
-                }
-                    break;
+                break;
+                case CONTROL_ID:
                 default:
+                    if (can_msg.id >= DEVICE_BASE_ID)
+                    {
+                        uint8_t device_id = (can_msg.id - DEVICE_BASE_ID);
+                        device_message_t dmsg;
+                        memcpy(&dmsg, can_msg.buf, can_msg.len);
+                        dev_handler(device_id, &dmsg, this);
+                    } else if (can_msg.id == CONTROL_ID) {
+                        // Handle control messages
+                        device_message_t dmsg;
+                        memcpy(&dmsg, can_msg.buf, can_msg.len);
+                        bro_handler(&dmsg, this);
+                    }
                     break;
             }
         }
@@ -60,7 +81,7 @@ public:
 
     void write(uint32_t id, uint8_t* buffer, size_t length) override
     {
-        if (buffer && length <= 8)
+        if (buffer && length <= CAN_FRAME_MAX_DATA_LENGTH)
         {
             CAN_message_t msg;
             msg.id = id;
@@ -68,6 +89,11 @@ public:
             memcpy(msg.buf, buffer, length);
             instance.write(msg);
         }
+    }
+
+    void end_frame(uint32_t id) override
+    {
+        write(id, frame_buffer, frame_length());
     }
 };
 

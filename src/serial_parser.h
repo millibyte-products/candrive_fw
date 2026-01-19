@@ -13,7 +13,7 @@
 #include "parser.h"
 #include "command_handler.h"
 
-//HardwareSerial Serial1(PA10, PA9); 
+//HardwareSerial Serial1(PA10, PA9);
 //HardwareSerial Serial2(PA3, PA2);
 HardwareSerial Serial3(PB11, PB10);
 
@@ -22,14 +22,25 @@ class SerialParser : public Parser
 private:
     HardwareSerial* instance;
 public:
-    SerialParser(dev_handler_t dev, dis_handler_t dis, HardwareSerial *ser = &Serial3) : Parser(dev, dis), instance(ser)
+    SerialParser(dev_handler_t dev, dis_handler_t dis, bro_handler_t bro, HardwareSerial *ser) : Parser(dev, dis, bro), instance(ser)
     {
         if (instance)
         {
-            //instance->setRx(PB11);
-            //instance->setTx(PB10);
             instance->begin(115200);
         }
+    }
+
+    SerialParser(dev_handler_t dev, dis_handler_t dis, bro_handler_t bro) : Parser(dev, dis, bro), instance(&Serial3)
+    {
+        if (instance)
+        {
+            instance->begin(115200);
+        }
+    }
+
+    void set_device_filter(int16_t device_id) override
+    {
+        // Noop for serial
     }
 
     void read() override
@@ -44,7 +55,7 @@ public:
             }
             device_message_t dmsg;
             instance->readBytes((uint8_t*)&dmsg, length);
-            dev_handler(&dmsg, this);
+            dev_handler(get_device_id(),&dmsg, this);
         }
     }
 
@@ -55,6 +66,11 @@ public:
         {
             instance->write(buffer, length);
         }
+    }
+
+    void end_frame(uint32_t id) override
+    {
+        write(id, frame_buffer, frame_length());
     }
 };
 

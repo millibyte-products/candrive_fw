@@ -14,21 +14,61 @@
 // #define VERSION_MINOR 9
 // #define VERSION_PATCH 0
 
-static uint8_t device_id = 0;
+#include "build_info.h"
 
-const uint8_t GIT_SHA[21] PROGMEM = {
-    BUILD_COMMIT, 0x00
-};
-const uint32_t FW_VER PROGMEM = VERSION_MAJOR << 16 | VERSION_MINOR << 8 | VERSION_PATCH;
-const uint64_t BUILD_TIMESTAMP PROGMEM = BUILD_TS;
-const uint8_t PROTOCOL_VER PROGMEM = 1;
+// Maps to upper 8 bits of CAN ID
+static int16_t device_id = INVALID_DEVICE;
+static reset_reason_t last_reason = RESET_REASON_UNKNOWN;
 
-uint8_t get_device_id()
+reset_reason_t get_reset_reason(void)
+{
+    reset_reason_t reset_reason = RESET_REASON_UNKNOWN;
+
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST))
+    {
+        reset_reason = RESET_REASON_LOW_POWER_RESET;
+    }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST))
+    {
+        reset_reason = RESET_REASON_WINDOW_WATCHDOG_RESET;
+    }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST))
+    {
+        reset_reason = RESET_REASON_INDEPENDENT_WATCHDOG_RESET;
+    }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST))
+    {
+        // NVIC_SystemReset()
+        reset_reason = RESET_REASON_SOFTWARE_RESET;
+    }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_PORRST))
+    {
+        reset_reason = RESET_REASON_POWER_ON_POWER_DOWN_RESET;
+    }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST))
+    {
+        reset_reason = RESET_REASON_EXTERNAL_RESET_PIN_RESET;
+    }
+
+    // Clear all the reset flags or else they will remain set during future
+    // resets until system power is fully removed.
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+
+    return reset_reason;
+}
+
+void init_device()
+{
+    device_id = INVALID_DEVICE;
+    last_reason = get_reset_reason();
+}
+
+int16_t get_device_id()
 {
     return device_id;
 }
 
-void set_device_id(uint8_t value)
+void set_device_id(int16_t value)
 {
     device_id = value;
 }
@@ -38,10 +78,22 @@ uint32_t get_serial_no()
     // TODO read/write to OTP
     return 0;
 }
-uint32_t get_fw_ver()
+uint8_t get_fw_major()
 {
     // Set by build system
-    return FW_VER;
+    return VERSION_MAJOR;
+}
+
+uint8_t get_fw_minor()
+{
+    // Set by build system
+    return VERSION_MINOR;
+}
+
+uint8_t get_fw_patch()
+{
+    // Set by build system
+    return VERSION_PATCH;
 }
 
 uint64_t get_build_ts()
@@ -50,7 +102,7 @@ uint64_t get_build_ts()
     return BUILD_TIMESTAMP;
 }
 
-uint8_t* get_build_commit()
+const uint8_t* get_build_commit()
 {
     // Set by build system
     return GIT_SHA;
@@ -66,4 +118,9 @@ uint8_t get_hw_ver()
 {
     // Read from flash metadata
     return 0;
+}
+
+reset_reason_t get_last_reset_reason(void)
+{
+    return last_reason;
 }

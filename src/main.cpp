@@ -5,6 +5,7 @@
 #include "stm32f1xx_hal.h"
 #include "stm32f1xx_hal_wwdg.h"
 #include "stm32f1xx_hal_iwdg.h"
+#include "stm32f1xx_hal_flash_ex.h"
 
 CommandHandler cmd_processor;
 
@@ -126,6 +127,7 @@ void TAMPER_IRQHandler(void)
 
 void SystemClock_Config(void)
 {
+  init_device();
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
@@ -163,16 +165,30 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+  
+  //__HAL_DBGMCU_FREEZE_IWDG();
+  //__HAL_DBGMCU_FREEZE_WWDG();
+  FLASH_OBProgramInitTypeDef option_bytes = {0};
+  HAL_FLASHEx_OBGetConfig(&option_bytes);
+  if (!(option_bytes.USERConfig & OB_IWDG_SW)) {
+      HAL_FLASH_Unlock();
+      HAL_FLASH_OB_Unlock();
+      HAL_FLASHEx_OBErase();
+      option_bytes.OptionType = OPTIONBYTE_USER;
+      option_bytes.USERConfig |= OB_IWDG_SW;
+      HAL_FLASHEx_OBProgram(&option_bytes);
+      HAL_FLASH_OB_Lock();
+      HAL_FLASH_Lock();
+      HAL_FLASH_OB_Launch(); // Triggers reset
+  }
 }
 
 void setup() {
-  WWDG->CR &= ~(1UL << WWDG_CR_WDGA_Pos);
-  __HAL_DBGMCU_FREEZE_IWDG();
-  __HAL_DBGMCU_FREEZE_WWDG();
+  //WWDG->CR &= ~(1UL << WWDG_CR_WDGA_Pos);
 }
 
 void loop() {
   cmd_processor.run();
-  WWDG->CR |= WWDG_CR_T_Msk; // Refresh WWDG
-  IWDG->KR = IWDG_KEY_RELOAD; // Refresh IWDG
+  //WWDG->CR |= WWDG_CR_T_Msk; // Refresh WWDG
+  //IWDG->KR = IWDG_KEY_RELOAD; // Refresh IWDG
 }
