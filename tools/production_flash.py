@@ -214,7 +214,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
     serial_no       INTEGER PRIMARY KEY,
     stm32_uid       TEXT,                       -- 24-char hex, factory UID
-    status          TEXT NOT NULL CHECK (status IN ('in_progress','ok','failed')),
+    status          TEXT NOT NULL CHECK (status IN ('in_progress','ok','failed','stale')),
     assigned_id     INTEGER,
     started_at      TEXT NOT NULL,
     finished_at     TEXT,
@@ -248,6 +248,31 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE devices ADD COLUMN stm32_uid TEXT")
     if "fw_version" not in cols:
         conn.execute("ALTER TABLE devices ADD COLUMN fw_version TEXT")
+    # Older schemas restricted status to ('in_progress','ok','failed').
+    # 'stale' was added when --force re-flashing was introduced. Detect
+    # the old CHECK constraint via sqlite_master and rebuild the table
+    # in place (SQLite has no ALTER for CHECK constraints).
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'"
+    ).fetchone()
+    if row and row[0] and "'stale'" not in row[0]:
+        # Rebuild table to relax the CHECK constraint. We can't wrap
+        # this in a single transaction because executescript() commits
+        # implicitly; the migration is idempotent and only runs once
+        # per db, so do it step-by-step.
+        conn.execute("ALTER TABLE devices RENAME TO devices_old")
+        conn.execute("DROP INDEX IF EXISTS idx_devices_status")
+        conn.execute("DROP INDEX IF EXISTS idx_devices_started")
+        conn.execute("DROP INDEX IF EXISTS idx_devices_uid_ok")
+        conn.executescript(SCHEMA)
+        new_cols = [r[1] for r in conn.execute("PRAGMA table_info(devices)")]
+        old_cols = [r[1] for r in conn.execute("PRAGMA table_info(devices_old)")]
+        shared = [c for c in new_cols if c in old_cols]
+        col_list = ",".join(shared)
+        conn.execute(
+            f"INSERT INTO devices ({col_list}) SELECT {col_list} FROM devices_old"
+        )
+        conn.execute("DROP TABLE devices_old")
 
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -264,6 +289,28 @@ def find_ok_by_uid(conn: sqlite3.Connection, uid: str) -> Optional[int]:
         "ORDER BY serial_no DESC LIMIT 1", (uid,),
     ).fetchone()
     return row[0] if row else None
+
+def mark_stale_by_uid(conn: sqlite3.Connection, uid: str, *,
+                      reason: str) -> list[int]:
+    """Demote any status='ok' rows for `uid` to 'stale' so the partial
+    UNIQUE index frees up and a fresh allocation can succeed. Returns
+    the list of serials that were demoted."""
+    rows = conn.execute(
+        "SELECT serial_no FROM devices WHERE stm32_uid=? AND status='ok'",
+        (uid,),
+    ).fetchall()
+    if not rows:
+        return []
+    serials = [r[0] for r in rows]
+    note = f"[{now_iso()}] superseded by --force re-flash: {reason}"
+    for s in serials:
+        conn.execute(
+            "UPDATE devices SET status='stale', "
+            "notes = COALESCE(notes || char(10), '') || ? "
+            "WHERE serial_no=?",
+            (note, s),
+        )
+    return serials
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
@@ -822,6 +869,15 @@ def cmd_flash(args: argparse.Namespace) -> int:
         warn(f"UID {uid} already provisioned as serial "
              f"{existing:#010x} (decimal {existing}); pass --force to re-flash")
         return 4
+    if existing is not None and args.force:
+        demoted = mark_stale_by_uid(
+            db, uid,
+            reason=f"operator={args.operator or os.environ.get('USER','')} "
+                   f"host={os.uname().nodename}",
+        )
+        if demoted:
+            info(f"--force: demoted {len(demoted)} prior 'ok' row(s) to 'stale': "
+                 + ", ".join(f"{s:#010x}" for s in demoted))
 
     sha, dirty = git_info()
     fw_ver = read_workspace_version()
