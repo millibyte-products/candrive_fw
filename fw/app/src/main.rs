@@ -34,10 +34,15 @@ mod control;
 mod encoder;
 mod foc;
 mod iwdg;
+mod led;
 mod motor;
 mod motor_pwm;
 mod spin_test;
 
+// Pre-PWM fallback heartbeat pin. Used only on the early-fault path
+// where the common API is missing and we can't bring up TIM3 / CAN.
+// Once `led::init` runs PB5 is reconfigured to TIM3 CH2 AF, replacing
+// this plain-GPIO mode.
 const LED_PIN: u8 = 5; // PB5 (STAT LED).
 const FW_MAJOR: u8 = 0;
 const FW_MINOR: u8 = 5;
@@ -192,6 +197,23 @@ fn handle(api: &CommonApi, msg: Message, identity: &mut Slot) -> Action {
                     persist_id: false,
                     save_params: true,
                 },
+                Command::SetLed => {
+                    if let ProtocolData::Led { sys, stat, update_flag } = data {
+                        led::apply_set(sys, stat, update_flag);
+                    }
+                    Action::reply(build_reply(identity.assigned_id, Command::SetLed,
+                        ProtocolData::Led {
+                            sys:  led::get(led::LED_SYS),
+                            stat: led::get(led::LED_STAT),
+                            update_flag: 0,
+                        }))
+                }
+                Command::GetLed => Action::reply(build_reply(identity.assigned_id, Command::GetLed,
+                    ProtocolData::Led {
+                        sys:  led::get(led::LED_SYS),
+                        stat: led::get(led::LED_STAT),
+                        update_flag: 0,
+                    })),
                 _ => Action::reply(build_reply(identity.assigned_id, Command::Ack, ProtocolData::Empty)),
             }
         }
@@ -293,6 +315,9 @@ fn main() -> ! {
 
     encoder::init();
     motor_pwm::init();
+    // motor_pwm::init programs SWJ_CFG=010 (JTAG off, SWD on) which
+    // frees PB4 (JTRST) for AF use. led::init must run after that.
+    led::init();
     // Synchronize encoder sampling + control step to the TIM2 update
     // event. The handler (#[interrupt] fn TIM2 below) divides the
     // 50 kHz PWM update rate down to a deterministic control-loop
@@ -317,7 +342,6 @@ fn main() -> ! {
     let _ = foc::calibrate; // ditto
 
     let mut frame = CanFrame::default();
-    let mut blink_counter: u32 = 0;
     let mut hb_counter: u32 = 0;
     let mut discovery_counter: u32 = 0;
     let mut enc_log_counter: u32 = 0;
@@ -362,11 +386,9 @@ fn main() -> ! {
             }
         }
 
-        blink_counter = blink_counter.wrapping_add(1);
-        if blink_counter >= 25_000 {
-            blink_counter = 0;
-            led_toggle();
-        }
+        // LED control is host-driven via SetLed; no firmware heartbeat
+        // toggle here. The CAN GetStatus heartbeat (~1 Hz, below) plus
+        // [enc] USART traffic are the in-firmware liveness signals.
 
         // Encoder sampling and control::step() now run from the TIM2
         // update ISR (see below). Main loop just observes the cached
