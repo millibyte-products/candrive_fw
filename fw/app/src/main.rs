@@ -46,9 +46,30 @@ mod spin_test;
 // Once `led::init` runs PB5 is reconfigured to TIM3 CH2 AF, replacing
 // this plain-GPIO mode.
 const LED_PIN: u8 = 5; // PB5 (STAT LED).
-const FW_MAJOR: u8 = 0;
-const FW_MINOR: u8 = 5;
-const FW_PATCH: u8 = 0;
+
+// Firmware version is the single source of truth from `[workspace.package]`
+// in fw/Cargo.toml. Bumped automatically by the release workflow.
+const FW_MAJOR: u8 = parse_u8(env!("CARGO_PKG_VERSION_MAJOR"));
+const FW_MINOR: u8 = parse_u8(env!("CARGO_PKG_VERSION_MINOR"));
+const FW_PATCH: u8 = parse_u8(env!("CARGO_PKG_VERSION_PATCH"));
+const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Short git SHA (10 chars) of the source the firmware was built from,
+/// or "unknown" outside a git checkout. Suffixed `-dirty` if the working
+/// tree had uncommitted changes at build time.
+const GIT_SHA: &str = env!("CANDRIVE_GIT_SHA");
+
+const fn parse_u8(s: &str) -> u8 {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut n: u32 = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < b'0' || b > b'9' { break; }
+        n = n * 10 + (b - b'0') as u32;
+        i += 1;
+    }
+    n as u8
+}
 
 const UNASSIGNED_ID: u8 = Slot::UNASSIGNED_ID;
 
@@ -437,8 +458,16 @@ fn main() -> ! {
     let api = unsafe { common_api::get() };
 
     (api.usart_init)(115_200);
-    let banner = b"\r\n[app] candrive v0.5.0\r\n";
+    let banner = b"\r\n[app] candrive v";
     (api.usart_write)(banner.as_ptr(), banner.len());
+    let v = FW_VERSION.as_bytes();
+    (api.usart_write)(v.as_ptr(), v.len());
+    let sep = b" (";
+    (api.usart_write)(sep.as_ptr(), sep.len());
+    let sha = GIT_SHA.as_bytes();
+    (api.usart_write)(sha.as_ptr(), sha.len());
+    let tail = b")\r\n";
+    (api.usart_write)(tail.as_ptr(), tail.len());
 
     // Decode reset cause. The bootloader runs first after every reset
     // and re-enters here, so this captures the original system reset.

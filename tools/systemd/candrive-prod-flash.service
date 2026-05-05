@@ -1,0 +1,51 @@
+# candrive production flashing daemon.
+#
+# Hands-off SWD flashing: leave one ST-Link adapter connected to the
+# host. The service polls the SWD bus for a target's STM32 factory
+# UID; whenever a fresh UID appears it allocates the next serial,
+# writes a USER_STORE record containing that serial, and programs
+# bootloader + common + app + user_store.
+#
+# Install:
+#   sudo cp tools/systemd/candrive-prod-flash.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now candrive-prod-flash.service
+#
+# Edit User=, WorkingDirectory=, and (optionally) --stlink-serial /
+# --db before enabling.
+
+[Unit]
+Description=candrive production SWD flasher
+Documentation=https://github.com/millibyte-products/candrive_fw
+# st-util / pyOCD / other openocd processes will fight over the
+# adapter. Order ourselves after the USB stack but otherwise stand alone.
+After=systemd-udevd.service local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=austen
+Group=austen
+# Where the firmware images and the script live. The DB is on the
+# bulk array so it survives host reinstalls.
+WorkingDirectory=/home/austen/candrive_fw
+ExecStart=/home/austen/candrive_fw/tools/production_flash.py monitor \
+    --db /mnt/bulk/backup/documents/candrive_fw_serials_prod.db \
+    --operator prod-line
+Restart=on-failure
+RestartSec=3s
+# OpenOCD wants USB raw access. Add the user to the plugdev group and
+# install a udev rule for ST-Link, or just run as root if simpler.
+# If the runtime user has plugdev, no extra capabilities are needed.
+
+# Unbuffered stdout so journalctl shows progress in real time.
+Environment=PYTHONUNBUFFERED=1
+
+# Lightweight hardening. Loosen if it interferes with USB/openocd.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/mnt/bulk/backup/documents
+
+[Install]
+WantedBy=multi-user.target

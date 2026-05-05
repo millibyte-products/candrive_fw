@@ -33,6 +33,19 @@ const LED_PIN: u8 = 4; // PB4 (SYS LED).
 const UNASSIGNED_ID: u8 = Slot::UNASSIGNED_ID;
 const SEND_SPIN_LIMIT: u32 = 200_000;
 
+const fn parse_u8(s: &str) -> u8 {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut n: u32 = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < b'0' || b > b'9' { break; }
+        n = n * 10 + (b - b'0') as u32;
+        i += 1;
+    }
+    n as u8
+}
+
 #[inline]
 fn send(api: &CommonApi, msg: &Message) -> bool {
     send_blocking(api, msg, SEND_SPIN_LIMIT)
@@ -128,7 +141,9 @@ fn run_update_mode(api: &CommonApi) -> ! {
                             send(api, &build_reply(my_id, Command::GetInfo,
                                 ProtocolData::Info {
                                     serial: identity.serial_no,
-                                    fw_major: 0, fw_minor: 4, fw_patch: 0,
+                                    fw_major: parse_u8(env!("CARGO_PKG_VERSION_MAJOR")),
+                                    fw_minor: parse_u8(env!("CARGO_PKG_VERSION_MINOR")),
+                                    fw_patch: parse_u8(env!("CARGO_PKG_VERSION_PATCH")),
                                 }));
                         }
                         (Command::StreamStart, ProtocolData::StreamStart { stream_length }) => {

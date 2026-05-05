@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install arm-none-eabi toolchain (for objcopy)
+        uses: carlosperate/arm-none-eabi-gcc-action@v1.10.1
+
+      - name: Install Rust toolchain (stable + thumbv7m-none-eabi)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7m-none-eabi
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            fw
+            tools
+
+      - name: Build firmware (bootloader + common + app)
+        run: make
+
+      - name: Report sizes
+        run: make size
+
+      - name: Run shared-crate host tests
+        run: make test
+
+      - name: Build host tools
+        run: cd tools && cargo build --release

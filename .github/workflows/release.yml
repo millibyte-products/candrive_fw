@@ -1,0 +1,165 @@
+name: Release
+
+# Cuts a GitHub Release whenever a `v*.*.*` tag is pushed. The tagged
+# commit's `[workspace.package].version` in fw/Cargo.toml MUST match
+# the tag (minus the leading `v`).
+#
+# After the release is published the workflow opens a follow-up commit
+# on the default branch (`main`) that bumps the patch component, so
+# development immediately resumes on a fresh in-progress version.
+#
+# Trigger from the local checkout with:
+#
+#   tools/bump_version.py set 0.9.0
+#   git commit -am "release: v0.9.0"
+#   git tag v0.9.0
+#   git push origin main v0.9.0
+#
+# (or push a tag from any branch — only the auto-bump targets `main`).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      git_sha: ${{ steps.meta.outputs.git_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # we want full history for git rev-parse
+
+      - name: Resolve version + sha
+        id: meta
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF##refs/tags/}"
+          ver="${tag#v}"
+          ws_ver=$(./tools/bump_version.py show)
+          if [ "$ver" != "$ws_ver" ]; then
+            echo "::error::tag $tag does not match workspace version $ws_ver"
+            exit 1
+          fi
+          sha=$(git rev-parse --short=10 HEAD)
+          echo "version=$ver"  >> "$GITHUB_OUTPUT"
+          echo "git_sha=$sha"  >> "$GITHUB_OUTPUT"
+
+      - name: Install arm-none-eabi toolchain
+        uses: carlosperate/arm-none-eabi-gcc-action@v1.10.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7m-none-eabi
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fw
+
+      - name: Build firmware
+        env:
+          CANDRIVE_GIT_SHA: ${{ steps.meta.outputs.git_sha }}
+        run: |
+          make
+          make size
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          ver="${{ steps.meta.outputs.version }}"
+          sha="${{ steps.meta.outputs.git_sha }}"
+          out="release-staging"
+          mkdir -p "$out"
+          for img in bootloader common app; do
+            cp build/${img}.elf "$out/candrive-${img}-v${ver}-${sha}.elf"
+            cp build/${img}.bin "$out/candrive-${img}-v${ver}-${sha}.bin"
+            cp build/${img}.hex "$out/candrive-${img}-v${ver}-${sha}.hex"
+          done
+          ( cd "$out" && sha256sum candrive-* | tee SHA256SUMS )
+
+      - name: Render release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          ver="${{ steps.meta.outputs.version }}"
+          sha="${{ steps.meta.outputs.git_sha }}"
+          long_sha=$(git rev-parse HEAD)
+          {
+            echo "candrive firmware v${ver}"
+            echo
+            echo "- Version: \`${ver}\`"
+            echo "- Git SHA: \`${long_sha}\` (short \`${sha}\`)"
+            echo "- Built from tag: \`${GITHUB_REF##refs/tags/}\`"
+            echo
+            echo "Image sizes:"
+            echo '```'
+            arm-none-eabi-size build/bootloader.elf build/common.elf build/app.elf
+            echo '```'
+            echo
+            echo "## Memory map"
+            echo
+            echo "| Image      | Address       |"
+            echo "|------------|---------------|"
+            echo "| bootloader | \`0x0800_0000\` |"
+            echo "| common     | \`0x0800_2000\` |"
+            echo "| app        | \`0x0800_3400\` |"
+            echo
+            echo "## Verification"
+            echo "Each artifact's SHA-256 is in \`SHA256SUMS\`. The \`GetInfo\` reply"
+            echo "from a flashed unit reports the same version, and \`production_flash.py\`"
+            echo "records both the version and the git SHA into the provisioning database."
+          } > NOTES.md
+          echo "path=NOTES.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: candrive v${{ steps.meta.outputs.version }}
+          body_path: ${{ steps.notes.outputs.path }}
+          files: |
+            release-staging/*
+            release-staging/SHA256SUMS
+
+  bump:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only auto-bump if the tag was actually built from main. Tags cut
+    # from feature branches are still released, but they don't move the
+    # development version forward (cherry-pick / re-tag from main when
+    # ready).
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump patch on main
+        run: |
+          set -euo pipefail
+          # Skip the bump unless main is at the tagged commit (i.e. the
+          # release was actually cut from main).
+          tag="${GITHUB_REF##refs/tags/}"
+          tag_sha=$(git rev-list -n1 "$tag")
+          main_sha=$(git rev-parse main)
+          if [ "$tag_sha" != "$main_sha" ]; then
+            echo "main ($main_sha) is not at tag $tag ($tag_sha); skipping auto-bump"
+            exit 0
+          fi
+          old=$(./tools/bump_version.py show)
+          new=$(./tools/bump_version.py patch)
+          echo "bumping $old -> $new"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fw/Cargo.toml
+          git commit -m "release: bump dev version to v${new} after v${old}"
+          git push origin main
