@@ -187,9 +187,10 @@ def cmd_get_position(s: socket.socket) -> None:
     r = expect_reply(s, CMD_GET_POSITION)
     if r is None:
         print("timeout"); sys.exit(1)
-    counts = r[1] | (r[2] << 8)
-    rad = (counts / 16384.0) * 2.0 * 3.141592653589793
-    print(f"angle_counts={counts} angle_rad={rad:.4f}")
+    # Wire format is Q-format radians: value = angle_rad * 65536 / (2*pi).
+    q = r[1] | (r[2] << 8)
+    rad = (q / 65536.0) * 2.0 * 3.141592653589793
+    print(f"angle_q={q} angle_rad={rad:.6f}")
 
 
 def main() -> None:

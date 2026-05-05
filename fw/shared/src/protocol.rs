@@ -172,6 +172,11 @@ pub enum ProtocolData {
     Empty,
     Info        { serial: u32, fw_major: u8, fw_minor: u8, fw_patch: u8 },
     InfoExt     { flags: u8, temperature: u8 },
+    /// Single-turn mechanical angle in **Q-format radians**: `value`
+    /// represents `angle_rad * 65536 / (2π)`, covering `[0, 2π)`.
+    /// 1 LSB ≈ 95.9 μrad. The 14-bit MT6701 encoder maps exactly via
+    /// `value = counts << 2`, so the wire form preserves full encoder
+    /// resolution with 4 bits of headroom for any future upgrade.
     Position    { value: u16 },
     Status(StatusBits),
     Analog      { a0: u16, a1: u16 },

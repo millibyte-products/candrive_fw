@@ -116,12 +116,13 @@ fn handle(api: &CommonApi, msg: Message, identity: &mut Slot) -> Action {
                 Command::GetStatus => Action::reply(build_reply(identity.assigned_id, Command::GetStatus,
                     ProtocolData::Status(StatusBits::default()))),
                 Command::GetPosition => {
-                    // Single-turn 14-bit angle (0..16383). The
-                    // multi-turn accumulator is exposed via
-                    // GetMotorParam(132) for callers that need it.
-                    let angle = encoder::last_sample().map(|s| s.angle).unwrap_or(0);
+                    // 14-bit encoder counts → Q-format radians on the
+                    // wire (value = counts << 2). See ProtocolData::
+                    // Position docs in shared/src/protocol.rs.
+                    let counts = encoder::last_sample().map(|s| s.angle).unwrap_or(0);
+                    let q = (counts as u16) << 2;
                     Action::reply(build_reply(identity.assigned_id, Command::GetPosition,
-                        ProtocolData::Position { value: angle }))
+                        ProtocolData::Position { value: q }))
                 }
                 Command::FirmwareUpdate => Action {
                     reply: Some(build_reply(identity.assigned_id, Command::Ack, ProtocolData::Empty)),
