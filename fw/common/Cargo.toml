@@ -1,8 +1,8 @@
 [package]
 name    = "candrive-common"
-version = "0.1.0"
-edition = "2021"
-license = "CC-BY-NC-SA-4.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 # Common is a no_main binary crate — it has no reset handler, no vector
 # table, no `main`. The output ELF exists only to be objcopy'd to a flash

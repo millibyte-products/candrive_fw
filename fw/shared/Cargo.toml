@@ -1,9 +1,9 @@
 [package]
 name        = "candrive-shared"
-version     = "0.1.0"
-edition     = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Types and constants shared between bootloader, common, app, and host tools."
-license     = "CC-BY-NC-SA-4.0"
 
 [lib]
 name = "candrive_shared"

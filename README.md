@@ -153,6 +153,34 @@ make test       # shared-crate host tests
 cd tools && cargo build --release
 ```
 
+## Releases
+
+The firmware version lives in a single place — `[workspace.package]`
+in [fw/Cargo.toml](fw/Cargo.toml) — and is inherited by every crate.
+The `app`/`bootloader` build scripts also bake the short git SHA in
+via `env!("CANDRIVE_GIT_SHA")`, so the boot banner and the `GetInfo`
+reply both report the version the firmware was actually built from.
+
+Cutting a release:
+
+```sh
+tools/bump_version.py set 0.9.0          # or `tools/bump_version.py minor`
+git commit -am "release: v0.9.0"
+git tag v0.9.0
+git push origin main v0.9.0
+```
+
+`.github/workflows/release.yml` triggers on `v*.*.*` tags, validates
+the tag against the workspace version, builds the firmware, computes
+SHA-256 sums, and creates a GitHub release with `bootloader`,
+`common`, and `app` (`.elf`/`.bin`/`.hex`) attached. After a successful
+release built from `main`, a follow-up commit auto-bumps the patch
+component on `main` so development continues at the next version.
+
+`production_flash.py` records `fw_version` and the git SHA into every
+DB row, so each provisioned unit is traceable back to a specific
+release artifact.
+
 ## Hardware notes
 
 - Encoder: MT6701 over SPI mode 0. CRC reads as mismatched (cosmetic);

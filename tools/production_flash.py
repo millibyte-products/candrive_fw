@@ -84,6 +84,7 @@ from typing import Iterable, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = ROOT / "build"
+WORKSPACE_TOML = ROOT / "fw" / "Cargo.toml"
 
 BOOTLOADER_BIN = BUILD_DIR / "bootloader.bin"
 COMMON_BIN     = BUILD_DIR / "common.bin"
@@ -221,6 +222,7 @@ CREATE TABLE IF NOT EXISTS devices (
     operator        TEXT,
     host            TEXT,
     stlink_serial   TEXT,
+    fw_version      TEXT,                       -- e.g. '0.9.0'
     git_sha         TEXT,
     git_dirty       INTEGER,
     bootloader_sha  TEXT,
@@ -240,8 +242,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_uid_ok
 
 def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(devices)")}
-    if cols and "stm32_uid" not in cols:
+    if not cols:
+        return
+    if "stm32_uid" not in cols:
         conn.execute("ALTER TABLE devices ADD COLUMN stm32_uid TEXT")
+    if "fw_version" not in cols:
+        conn.execute("ALTER TABLE devices ADD COLUMN fw_version TEXT")
 
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +273,7 @@ def allocate_serial(conn: sqlite3.Connection, *,
                     stlink_serial: str,
                     operator: str,
                     host: str,
+                    fw_version: str,
                     git_sha: str,
                     git_dirty: bool) -> int:
     """Pick the next free serial under a write transaction and INSERT a
@@ -279,10 +286,10 @@ def allocate_serial(conn: sqlite3.Connection, *,
         next_serial = max(cur_max, FACTORY_SERIAL) + 1
         cur.execute(
             "INSERT INTO devices (serial_no,stm32_uid,status,started_at,operator,host,"
-            "stlink_serial,git_sha,git_dirty) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "stlink_serial,fw_version,git_sha,git_dirty) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (next_serial, stm32_uid, "in_progress", now_iso(), operator, host,
-             stlink_serial, git_sha, 1 if git_dirty else 0),
+             stlink_serial, fw_version, git_sha, 1 if git_dirty else 0),
         )
         cur.execute("COMMIT")
         return next_serial
@@ -322,6 +329,24 @@ def sha256_file(p: Path) -> str:
 
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
+
+_VERSION_RE = re.compile(
+    r"^\s*version\s*=\s*\"([^\"]+)\"\s*$", re.MULTILINE,
+)
+
+def read_workspace_version(toml_path: Path = WORKSPACE_TOML) -> str:
+    """Read the workspace.package.version from fw/Cargo.toml. Falls back
+    to '0.0.0' if the section can't be parsed."""
+    try:
+        text = toml_path.read_text()
+    except OSError:
+        return "0.0.0"
+    # Find the [workspace.package] section, then the first version = "..."
+    m = re.search(r"\[workspace\.package\][^\[]*", text)
+    if not m:
+        return "0.0.0"
+    vm = _VERSION_RE.search(m.group(0))
+    return vm.group(1) if vm else "0.0.0"
 
 def git_info() -> tuple[str, bool]:
     try:
@@ -462,13 +487,16 @@ def cmd_flash(args: argparse.Namespace) -> int:
         return 4
 
     sha, dirty = git_info()
+    fw_ver = read_workspace_version()
     serial = allocate_serial(db,
                              stm32_uid=uid,
                              stlink_serial=link.serial,
                              operator=args.operator or os.environ.get("USER",""),
                              host=os.uname().nodename,
+                             fw_version=fw_ver,
                              git_sha=sha, git_dirty=dirty)
-    info(f"allocated serial {serial:#010x} (decimal {serial})")
+    info(f"allocated serial {serial:#010x} (decimal {serial}) "
+         f"— fw v{fw_ver} @ {sha[:10] or 'unknown'}{' (dirty)' if dirty else ''}")
 
     user_store_page = build_user_store_page(serial)
     user_store_sha  = sha256_bytes(user_store_page)
@@ -582,7 +610,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     db = open_db(args.db)
     rows = db.execute(
         "SELECT serial_no,stm32_uid,status,started_at,duration_ms,"
-        "stlink_serial,operator,git_sha "
+        "stlink_serial,operator,fw_version,git_sha "
         "FROM devices ORDER BY serial_no DESC LIMIT ?",
         (args.limit,),
     ).fetchall()
@@ -591,12 +619,13 @@ def cmd_list(args: argparse.Namespace) -> int:
         return 0
     print(f"{'serial':>10}  {'stm32_uid':<24}  {'status':<12} "
           f"{'started_at':<21} {'dur_ms':>7}  {'op':<10} "
-          f"{'stlink':<14} git")
-    for sn, uid, status, started, dur, stlink, op, sha in rows:
+          f"{'stlink':<14} {'fw_ver':<8} git")
+    for sn, uid, status, started, dur, stlink, op, fwv, sha in rows:
         sn_s = f"0x{sn:08X}"
         print(f"{sn_s:>10}  {(uid or '-'):<24}  {status:<12} "
               f"{started or '':<21} {(dur or 0):>7}  {(op or ''):<10} "
-              f"{(stlink or ''):<14} {(sha or '')[:10]}")
+              f"{(stlink or ''):<14} {(fwv or '-'):<8} "
+              f"{(sha or '')[:10]}")
     return 0
 
 def cmd_show(args: argparse.Namespace) -> int:
