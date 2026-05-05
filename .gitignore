@@ -37,3 +37,23 @@
 /.vscode
 
 tools/target
+tools/Cargo.lock
+
+# Cargo build artifacts
+fw/target/
+**/target/
+
+# Build outputs
+build/
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+__pycache__/
+*.pyc
+
+# Vendored ST sources (managed via submodules in vendor/)
+vendor/cmsis_core/
+vendor/cmsis_device_f1/
+vendor/stm32f1xx_hal_driver/
