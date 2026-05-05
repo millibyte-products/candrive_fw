@@ -105,6 +105,17 @@ pub fn params_scan() -> ScanResult {
     params_store::scan(page_bytes())
 }
 
+/// Erase the entire user-store flash page. Wipes both the identity
+/// record and any saved motor parameters; on next boot the device
+/// will load factory defaults and re-issue a `DiscoveryReq`. Returns
+/// `true` on success.
+pub fn erase_user_store(api: &CommonApi) -> bool {
+    if (api.flash_unlock)() != 0 { return false; }
+    let ok = (api.flash_erase_page)(USER_STORE_BASE) == 0;
+    (api.flash_lock)();
+    ok
+}
+
 /// Build a device-side `Control` reply (controller bit clear).
 #[inline]
 pub fn build_reply(device_id: u8, cmd: Command, data: ProtocolData) -> Message {

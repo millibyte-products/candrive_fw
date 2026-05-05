@@ -77,11 +77,17 @@ struct Action {
     reboot_into_bl: bool,
     persist_id: bool,
     save_params: bool,
+    /// Reset assigned_id back to UNASSIGNED and persist. Triggers
+    /// re-discovery on the next main-loop pass.
+    clear_id: bool,
+    /// Erase the entire user-store flash page (identity + saved
+    /// params). Forces a factory-default reload on next boot.
+    erase_store: bool,
 }
 
 impl Action {
-    fn nothing() -> Self { Self { reply: None, reboot_into_bl: false, persist_id: false, save_params: false } }
-    fn reply(m: Message) -> Self { Self { reply: Some(m), reboot_into_bl: false, persist_id: false, save_params: false } }
+    fn nothing() -> Self { Self { reply: None, reboot_into_bl: false, persist_id: false, save_params: false, clear_id: false, erase_store: false } }
+    fn reply(m: Message) -> Self { Self { reply: Some(m), reboot_into_bl: false, persist_id: false, save_params: false, clear_id: false, erase_store: false } }
 }
 
 /// Dispatch one received frame.
@@ -93,10 +99,31 @@ fn handle(api: &CommonApi, msg: Message, identity: &mut Slot) -> Action {
                 Action {
                     reply: None,
                     reboot_into_bl: false,
-                    persist_id: true,                    save_params: false,                }
+                    persist_id: true,                    save_params: false,                    clear_id: false, erase_store: false,                }
             } else {
                 Action::nothing()
             }
+        }
+        Message::Controller(buf, len) => {
+            // Broadcast / controller-channel traffic. Currently the
+            // only command we recognise is NetworkReset (0x12) which
+            // tells every device on the bus to drop their assigned id
+            // and re-discover.
+            if (len as usize) >= 1 {
+                let cmd = Command::from_u8(buf[0] & candrive_shared::protocol::COMMAND_MASK);
+                if cmd == Command::NetworkReset {
+                    identity.assigned_id = UNASSIGNED_ID;
+                    return Action {
+                        reply: None,
+                        reboot_into_bl: false,
+                        persist_id: true,
+                        save_params: false,
+                        clear_id: true,
+                        erase_store: false,
+                    };
+                }
+            }
+            Action::nothing()
         }
         Message::Control { device_id, is_controller, cmd, data } => {
             if !is_controller || device_id != identity.assigned_id
@@ -138,11 +165,62 @@ fn handle(api: &CommonApi, msg: Message, identity: &mut Slot) -> Action {
                     Action::reply(build_reply(identity.assigned_id, Command::GetPosition,
                         ProtocolData::Position { value: q }))
                 }
+                Command::SetPosition => {
+                    // Wire format is the same Q-format radians used by
+                    // GetPosition. Dispatched as PositionAbsShortest
+                    // (mode 5) so the controller picks the shortest
+                    // signed path to the requested wrapped angle.
+                    let q = match data {
+                        ProtocolData::Position { value } => value,
+                        _ => 0,
+                    };
+                    let target = (q as f32) * (core::f32::consts::TAU / 65536.0);
+                    control::set_command(5, target);
+                    Action::reply(build_reply(identity.assigned_id, Command::SetPosition,
+                        ProtocolData::Position { value: q }))
+                }
+                Command::RevokeConfig => {
+                    // Targeted: only act if the host's serial_no matches
+                    // our own. Reply Ack regardless so the host knows
+                    // the device received it.
+                    let mine = match data {
+                        ProtocolData::RevokeConfig { serial_no } => serial_no == identity.serial_no,
+                        _ => false,
+                    };
+                    let mut act = Action::reply(build_reply(identity.assigned_id, Command::Ack,
+                        ProtocolData::Empty));
+                    if mine {
+                        identity.assigned_id = UNASSIGNED_ID;
+                        act.persist_id = true;
+                        act.clear_id = true;
+                    }
+                    act
+                }
+                Command::EraseUserStore => {
+                    // Wipes both identity and saved motor params. The
+                    // erase happens in the main loop (deferred so we
+                    // can pet the watchdog around it).
+                    let mut act = Action::reply(build_reply(identity.assigned_id, Command::Ack,
+                        ProtocolData::Empty));
+                    act.erase_store = true;
+                    act
+                }
+                Command::NetworkReset => {
+                    // Targeted variant on the device channel. Same
+                    // effect as the broadcast version handled above.
+                    identity.assigned_id = UNASSIGNED_ID;
+                    let mut act = Action::reply(build_reply(identity.assigned_id, Command::Ack,
+                        ProtocolData::Empty));
+                    act.persist_id = true;
+                    act.clear_id = true;
+                    act
+                }
                 Command::FirmwareUpdate => Action {
                     reply: Some(build_reply(identity.assigned_id, Command::Ack, ProtocolData::Empty)),
                     reboot_into_bl: true,
                     persist_id: false,
                     save_params: false,
+                    clear_id: false, erase_store: false,
                 },
                 Command::GetMotorParam => {
                     let idx = match data {
@@ -219,6 +297,7 @@ fn handle(api: &CommonApi, msg: Message, identity: &mut Slot) -> Action {
                     reboot_into_bl: false,
                     persist_id: false,
                     save_params: true,
+                    clear_id: false, erase_store: false,
                 },
                 Command::SetLed => {
                     if let ProtocolData::Led { sys, stat, update_flag } = data {
@@ -467,6 +546,25 @@ fn main() -> ! {
                     let mut buf = [0.0f32; 32];
                     let n = motor::snapshot(&mut buf);
                     let _ = identity::persist_params(api, &buf[..n]);
+                }
+                if act.erase_store {
+                    // Disable the bridge before we touch flash; flash
+                    // writes block CPU for ~tens of ms while the FOC
+                    // ISR keeps firing, but with the bridge off the
+                    // motor stays free.
+                    motor_pwm::set_enable(false);
+                    control::set_command(0, 0.0);
+                    let _ = identity::erase_user_store(api);
+                    // Reload identity from flash (now factory) so the
+                    // local copy matches what's on disk.
+                    identity = identity::load_identity(api);
+                    let msg = b"[app] user_store erased\r\n";
+                    (api.usart_write)(msg.as_ptr(), msg.len());
+                }
+                if act.clear_id {
+                    // Re-issue DiscoveryReq immediately so the host can
+                    // re-assign without waiting on the 2 s retry timer.
+                    send_discovery_req(api, &identity);
                 }
                 if let Some(reply) = act.reply {
                     if let Ok(out) = reply.encode() {

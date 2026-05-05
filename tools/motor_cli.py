@@ -32,6 +32,7 @@ CMD_GET_LED = 0x09
 CMD_SET_LED = 0x0A
 
 CMD_GET_POSITION = 0x03
+CMD_SET_POSITION = 0x04
 CMD_GET_STATUS   = 0x05
 CMD_GET_ANALOG   = 0x06
 CMD_GET_SERVO    = 0x07
@@ -40,6 +41,10 @@ CMD_GET_MOTOR    = 0x0B
 CMD_SET_MOTOR    = 0x0C
 CMD_GET_FOC      = 0x0D
 CMD_SET_FOC      = 0x0E
+
+CMD_NETWORK_RESET    = 0x10
+CMD_ERASE_USER_STORE = 0x11
+CMD_REVOKE_CONFIG    = 0x13
 
 # Servo update_flag bits (matches the firmware servo module).
 SRV_UPDATE_S0 = 0x01
@@ -299,6 +304,49 @@ def cmd_get_foc(s: socket.socket) -> None:
           f"phase_b={f3}/255 ({pct(f3):.1f}%) en={en}")
 
 
+def cmd_set_position(s: socket.socket, target_rad: float) -> None:
+    # Wrap to [0, 2pi) then encode as Q-format radians.
+    two_pi = 2.0 * 3.141592653589793
+    wrapped = target_rad % two_pi
+    if wrapped < 0:
+        wrapped += two_pi
+    q = int(round(wrapped * 65536.0 / two_pi)) & 0xFFFF
+    payload = struct.pack("<H", q)
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_SET_POSITION | CONTROLLER_BIT]) + payload)
+    r = expect_reply(s, CMD_SET_POSITION)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    q_r = r[1] | (r[2] << 8)
+    rad_r = (q_r / 65536.0) * two_pi
+    print(f"target_q={q_r} target_rad={rad_r:.6f}")
+
+
+def cmd_network_reset(s: socket.socket) -> None:
+    # Broadcast on the controller channel (CAN ID 0).
+    send(s, 0x000, bytes([CMD_NETWORK_RESET | CONTROLLER_BIT]))
+    print("network_reset broadcast sent (no reply expected)")
+
+
+def cmd_erase_user_store(s: socket.socket) -> None:
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_ERASE_USER_STORE | CONTROLLER_BIT]))
+    r = expect_reply(s, 0x7F, timeout=2.0)  # Ack
+    if r is None:
+        print("timeout"); sys.exit(1)
+    print(f"acked: 0x{r[0]:02x}")
+
+
+def cmd_revoke_config(s: socket.socket, serial_no: int) -> None:
+    payload = struct.pack("<I", serial_no & 0xFFFFFFFF)
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_REVOKE_CONFIG | CONTROLLER_BIT]) + payload)
+    r = expect_reply(s, 0x7F, timeout=2.0)  # Ack
+    if r is None:
+        print("timeout"); sys.exit(1)
+    print(f"acked: 0x{r[0]:02x}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iface", default="can0")
@@ -347,6 +395,15 @@ def main() -> None:
     sm.add_argument("state", choices=["on", "off"])
 
     sub.add_parser("get-foc", help="read current per-phase PWM duties")
+
+    sp = sub.add_parser("set-position", help="absolute-shortest move to target (rad)")
+    sp.add_argument("target", type=float, help="target angle in radians")
+
+    sub.add_parser("network-reset", help="broadcast: every device drops its assigned id")
+    sub.add_parser("erase-user-store", help="factory reset: erase id + saved params")
+    rc = sub.add_parser("revoke-config", help="reset id only; --serial must match this device")
+    rc.add_argument("--serial", type=lambda v: int(v, 0), required=True,
+                    help="device serial_no (factory default 0xCAFEBABE)")
 
     args = p.parse_args()
     s = open_can(args.iface)
@@ -399,6 +456,14 @@ def main() -> None:
         cmd_set_motor(s, args.state == "on")
     elif args.cmd == "get-foc":
         cmd_get_foc(s)
+    elif args.cmd == "set-position":
+        cmd_set_position(s, args.target)
+    elif args.cmd == "network-reset":
+        cmd_network_reset(s)
+    elif args.cmd == "erase-user-store":
+        cmd_erase_user_store(s)
+    elif args.cmd == "revoke-config":
+        cmd_revoke_config(s, args.serial)
 
 
 if __name__ == "__main__":
