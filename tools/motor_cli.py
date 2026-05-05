@@ -33,6 +33,17 @@ CMD_SET_LED = 0x0A
 
 CMD_GET_POSITION = 0x03
 CMD_GET_STATUS   = 0x05
+CMD_GET_ANALOG   = 0x06
+CMD_GET_SERVO    = 0x07
+CMD_SET_SERVO    = 0x08
+CMD_GET_MOTOR    = 0x0B
+CMD_SET_MOTOR    = 0x0C
+CMD_GET_FOC      = 0x0D
+CMD_SET_FOC      = 0x0E
+
+# Servo update_flag bits (matches the firmware servo module).
+SRV_UPDATE_S0 = 0x01
+SRV_UPDATE_S1 = 0x02
 
 # `update_flag` bits in the SetLed payload.
 LED_UPDATE_STAT = 0x01
@@ -216,6 +227,78 @@ def cmd_get_status(s: socket.socket) -> None:
           f"endstop0={endstop0} endstop1={endstop1} misc={misc}")
 
 
+def cmd_get_analog(s: socket.socket) -> None:
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_ANALOG | CONTROLLER_BIT, 0, 0, 0, 0]))
+    r = expect_reply(s, CMD_GET_ANALOG)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    a0 = r[1] | (r[2] << 8)
+    a1 = r[3] | (r[4] << 8)
+    print(f"a0={a0} ({a0 * 3.3 / 4095.0:.3f} V)  a1={a1} ({a1 * 3.3 / 4095.0:.3f} V)")
+
+
+def cmd_get_servo(s: socket.socket) -> None:
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_SERVO | CONTROLLER_BIT, 0, 0, 0, 0, 0]))
+    r = expect_reply(s, CMD_GET_SERVO)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    s0 = r[1] | (r[2] << 8)
+    s1 = r[3] | (r[4] << 8)
+    print(f"srv0={s0} us  srv1={s1} us")
+
+
+def cmd_set_servo(s: socket.socket, s0: int, s1: int, mask: int) -> None:
+    payload = struct.pack("<HHB", s0 & 0xFFFF, s1 & 0xFFFF, mask & 0xFF)
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_SET_SERVO | CONTROLLER_BIT]) + payload)
+    r = expect_reply(s, CMD_SET_SERVO)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    s0_r = r[1] | (r[2] << 8)
+    s1_r = r[3] | (r[4] << 8)
+    print(f"srv0={s0_r} us  srv1={s1_r} us")
+
+
+def cmd_get_motor(s: socket.socket) -> None:
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_MOTOR | CONTROLLER_BIT, 0, 0, 0]))
+    r = expect_reply(s, CMD_GET_MOTOR)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    value = r[1] | (r[2] << 8)
+    flags = r[3]
+    rst = bool(flags & 0x01)
+    sleep = bool(flags & 0x02)
+    print(f"value={value} rst={rst} sleep={sleep} (bridge_enabled={rst and sleep})")
+
+
+def cmd_set_motor(s: socket.socket, enable: bool) -> None:
+    flags = 0x03 if enable else 0x00
+    payload = bytes([0, 0, flags])
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_SET_MOTOR | CONTROLLER_BIT]) + payload)
+    r = expect_reply(s, CMD_SET_MOTOR)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    flags_r = r[3]
+    rst, slp = bool(flags_r & 0x01), bool(flags_r & 0x02)
+    print(f"bridge_enabled={rst and slp} (rst={rst} sleep={slp})")
+
+
+def cmd_get_foc(s: socket.socket) -> None:
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_FOC | CONTROLLER_BIT, 0, 0, 0, 0]))
+    r = expect_reply(s, CMD_GET_FOC)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    f1, f2, f3, en = r[1], r[2], r[3], r[4]
+    pct = lambda v: 100.0 * v / 255.0
+    print(f"phase_a={f1}/255 ({pct(f1):.1f}%) phase_c={f2}/255 ({pct(f2):.1f}%) "
+          f"phase_b={f3}/255 ({pct(f3):.1f}%) en={en}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iface", default="can0")
@@ -249,6 +332,21 @@ def main() -> None:
 
     sub.add_parser("get-position", help="read single-turn encoder angle (counts + rad)")
     sub.add_parser("get-status", help="read status byte (endstops, fault, mag)")
+    sub.add_parser("get-analog", help="read A0 / A1 ADC inputs (raw + volts)")
+    sub.add_parser("get-servo", help="read SRV0 / SRV1 servo pulse widths (us)")
+
+    ss = sub.add_parser("set-servo", help="set SRV0/SRV1 pulse width in us (0=off)")
+    ss.add_argument("--s0", type=int, default=0)
+    ss.add_argument("--s1", type=int, default=0)
+    ss.add_argument("--mask", type=lambda v: int(v, 0), default=None,
+                    help="override update mask (default: bits set for whichever "
+                         "of --s0 / --s1 were given)")
+
+    sub.add_parser("get-motor", help="read bridge enable state (NRST/NSLEEP)")
+    sm = sub.add_parser("set-motor", help="force bridge enable / disable")
+    sm.add_argument("state", choices=["on", "off"])
+
+    sub.add_parser("get-foc", help="read current per-phase PWM duties")
 
     args = p.parse_args()
     s = open_can(args.iface)
@@ -280,6 +378,27 @@ def main() -> None:
         cmd_get_position(s)
     elif args.cmd == "get-status":
         cmd_get_status(s)
+    elif args.cmd == "get-analog":
+        cmd_get_analog(s)
+    elif args.cmd == "get-servo":
+        cmd_get_servo(s)
+    elif args.cmd == "set-servo":
+        if args.mask is None:
+            argv = sys.argv
+            mask = 0
+            if any(a.startswith("--s0") for a in argv): mask |= SRV_UPDATE_S0
+            if any(a.startswith("--s1") for a in argv): mask |= SRV_UPDATE_S1
+            if mask == 0:
+                mask = SRV_UPDATE_S0 | SRV_UPDATE_S1
+        else:
+            mask = args.mask
+        cmd_set_servo(s, args.s0, args.s1, mask)
+    elif args.cmd == "get-motor":
+        cmd_get_motor(s)
+    elif args.cmd == "set-motor":
+        cmd_set_motor(s, args.state == "on")
+    elif args.cmd == "get-foc":
+        cmd_get_foc(s)
 
 
 if __name__ == "__main__":
