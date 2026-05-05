@@ -1,0 +1,15 @@
+# Default everything in this directory tree to the Cortex-M3 target. tools/
+# at the repo root has no .cargo/config.toml so it builds for the host as
+# usual.
+[build]
+target = "thumbv7m-none-eabi"
+
+[target.thumbv7m-none-eabi]
+# We provide our own linker scripts via build.rs per crate. The runner is
+# only used by `cargo run`, which we never invoke (we flash via dev_setup.py).
+rustflags = [
+  "-C", "link-arg=--nmagic",      # disable page alignment in the linker
+  "-C", "link-arg=-Tlink.x",      # cortex-m-rt's link.x (bootloader/app);
+                                  # common overrides via its own linker
+                                  # script + a build.rs --remove of -Tlink.x
+]

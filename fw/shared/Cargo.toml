@@ -1,0 +1,14 @@
+[package]
+name        = "candrive-shared"
+version     = "0.1.0"
+edition     = "2021"
+description = "Types and constants shared between bootloader, common, app, and host tools."
+license     = "CC-BY-NC-SA-4.0"
+
+[lib]
+name = "candrive_shared"
+
+[dependencies]
+# Intentionally none — this crate must remain dependency-free so it can be
+# linked into the no-std common image and the std host tooling without
+# pulling in either world's runtime.

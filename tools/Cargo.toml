@@ -13,6 +13,12 @@ byteorder = "1.5.0"
 socketcan = {version = "3.5.0", features = ["tokio"] }
 nb = "1.1.0"
 crossbeam-channel = "0.5.15"
+log = "0.4.29"
+simplelog = "0.12.2"
+strum = "0.27.2"
+strum_macros = "0.27.2"
+lazy_static = "1.5.0"
+backtrace = "0.3.76"
 
 [[bin]]
 name = "candrive-cli"

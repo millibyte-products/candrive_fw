@@ -1,0 +1,22 @@
+[package]
+name    = "candrive-common"
+version = "0.1.0"
+edition = "2021"
+license = "CC-BY-NC-SA-4.0"
+
+# Common is a no_main binary crate — it has no reset handler, no vector
+# table, no `main`. The output ELF exists only to be objcopy'd to a flash
+# blob that's programmed at 0x08001000. The bootloader & app reach in
+# through the api_table at offset 0.
+[[bin]]
+name = "common"
+path = "src/main.rs"
+
+[dependencies]
+candrive-shared = { path = "../shared" }
+cortex-m        = "0.7"
+stm32f1         = { version = "0.15", features = ["stm32f103"] }
+
+# No cortex-m-rt — we don't want its link.x or its reset handler.
+# No panic-halt — common must not panic; we'll catch any with a custom
+# panic handler that traps and lets the bootloader's watchdog reset us.
