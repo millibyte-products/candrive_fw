@@ -392,13 +392,12 @@ impl MessageFilter {
         }
     }
 
-    fn expect_ack(id: DeviceId, cmd: CommandTypes) -> MessageFilter
+    fn expect_ack(id: DeviceId) -> MessageFilter
     {
         let dev_id = id;
-        let query_cmd = cmd;
         MessageFilter {
             id_filter: Some(id),
-            message_filter: Some(cmd),
+            message_filter: Some(CommandTypes::Ack),
             timeout: Some((Instant::now(), Duration::from_secs(5), Box::new(move |id_pool: &mut IdPool| {
                 get_can_tx_queue().send(CanDriveMessage::Control {
                     id: dev_id,
@@ -410,7 +409,7 @@ impl MessageFilter {
                 Ok(())
             }))),
             action: Some(Box::new(move |_, _| {
-                info!("Device {dev_id}: Acknowledged {query_cmd:?}");
+                info!("Device {dev_id}: Acknowledge");
                 Ok(())
             })),
         }
@@ -752,6 +751,10 @@ impl DeviceManager {
             CommandTypes::RevokeConfig => {
                 Ok(())
             },
+            CommandTypes::EraseUserStore => {
+                db.add_filter(MessageFilter::expect_ack(query_id));
+                Ok(())
+            },
             CommandTypes::Error => {
                 Err("Error is not queryable".to_string())
             },
@@ -762,7 +765,7 @@ impl DeviceManager {
                 Err("Invalid command".to_string())
             },
             _ => {
-                db.add_filter(MessageFilter::expect_ack(query_id, CommandTypes::Ack));
+                db.add_filter(MessageFilter::expect_ack(query_id));
                 Ok(())
             }
         }
@@ -771,6 +774,16 @@ impl DeviceManager {
     pub fn broadcast(&self, msg: CanDriveMessage) -> Result<(), String> {
         // Broadcast does not expect a response
         self.can_tx.send(msg).map_err(|e| format!("{}", e))
+    }
+
+    pub fn write_stream(&mut self, device_serial: u32,target: CommandTypes, data: &[u8]) -> Result<(), String>
+    {
+       Ok(())
+    }
+
+    pub fn read_stream(&mut self, device_serial: u32, target: CommandTypes, length: u32) -> Result<Vec<u8>, String>
+    {
+        Ok(Vec::new())
     }
 }
 

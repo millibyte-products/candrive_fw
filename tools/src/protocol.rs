@@ -39,13 +39,13 @@ pub enum Commands {
     SetFOC,
     // Streams allow uart <-> can bridging
     StreamStart, // Start streaming to device UART
-    StreamData,  // Stream write (TX) data
+    StreamRead,  // Stream write (TX) data
+    StreamWrite,
     Ack,
-    StartFwUpdate,
-    FWUpdate,
-    NetworkReset,
-    OverwriteUserStore,
+    FirmwareUpdate,
+    UserStoreUpdate,
     EraseUserStore,
+    NetworkReset,
     RevokeConfig,
     Error,
     Invalid = 0x7F,
@@ -72,15 +72,14 @@ impl Commands {
             13 => GetFOC,
             14 => SetFOC,
             15 => StreamStart, // Start streaming to device UART
-            16 => StreamData,  // Stream write (TX) data
-            17 => Ack,
-            18 => StartFwUpdate,
-            19 => FWUpdate,
-            20 => NetworkReset,
-            21 => OverwriteUserStore,
-            22 => EraseUserStore,
-            23 => RevokeConfig,
-            24 => Error,
+            16 => StreamRead,  // Stream write (TX) data
+            17 => StreamWrite,
+            18 => Ack,
+            19 => FirmwareUpdate,
+            20 => UserStoreUpdate,
+            21 => EraseUserStore,
+            22 => RevokeConfig,
+            23 => Error,
             _ => Invalid,
         }
     }
@@ -283,16 +282,14 @@ pub enum ProtocolData {
         en: u8,
     },
     StreamStart {
-        stream_target: u8,
-        stream_length: u16,
-        flags: u8,
+        stream_length: u32,
+        checksum: u32
     },
     StreamFragment {
-        sequence: u8,
-        data: [u8; 4],
+        data: [u8; 7],
     },
     RevokeConfig {
-        device_id: u8,
+        serial_no: u32,
     },
     Error {
         code: u8,
@@ -383,17 +380,15 @@ impl CanDriveMessage {
                     bytes.push(*foc_3);
                     bytes.push(*en);
                 }
-                ProtocolData::StreamStart { stream_target, stream_length, flags } => {
-                    bytes.push(*stream_target);
-                    bytes.write_u16::<LittleEndian>(*stream_length).map_err(|e| e.to_string())?;
-                    bytes.push(*flags);
+                ProtocolData::StreamStart { stream_length, checksum } => {
+                    bytes.write_u32::<LittleEndian>(*stream_length).map_err(|e| e.to_string())?;
+                    bytes.write_u32::<LittleEndian>(*checksum).map_err(|e| e.to_string())?;
                 }
-                ProtocolData::StreamFragment { sequence, data } => {
-                    bytes.push(*sequence);
+                ProtocolData::StreamFragment { data } => {
                     bytes.extend(data);
                 },
-                ProtocolData::RevokeConfig { device_id } => {
-                    bytes.push(*device_id);
+                ProtocolData::RevokeConfig { serial_no } => {
+                    bytes.write_u32::<LittleEndian>(*serial_no).map_err(|e| e.to_string())?;
                 },
                 ProtocolData::Error { code, message } => {
                     bytes.push(*code);
@@ -431,8 +426,12 @@ impl CanDriveMessage {
     }
 
     pub fn parse_can_frame(id: u16, bytes: &[u8]) -> Result<Option<CanDriveMessage>, String> {
+        if bytes.len() < 1 {
+            return Err("Empty CAN frame".to_string());
+        }
         let cmd = bytes[0] & 0x7F;
         let is_controller = (bytes[0] & 0x80) == 0x80;
+
         let data = &bytes[1..];
         let msg: CanDriveMessage;
         if id == CONTROLLER_ID {
@@ -595,30 +594,25 @@ impl CanDriveMessage {
                         return Err("Underflow device_stream_start message".to_string());
                     }
                     ProtocolData::StreamStart {
-                        stream_target: data[0],
-                        stream_length: LittleEndian::read_u16(&data[1..3]),
-                        flags: data[3],
+                        stream_length: LittleEndian::read_u32(&data[0..4]),
+                        checksum: LittleEndian::read_u32(&data[4..8]),
                     }
                 }
-                StreamData => {
-                    if data.len() < 4 {
-                        return Err("Underflow device_stream_data message".to_string());
-                    }
-                    let mut s_data = [0; 4];
-                    s_data.copy_from_slice(&bytes[1..5]);
+                StreamRead => {
+                    let mut f_data: [u8; 7] = [0; 7];
+                    f_data.copy_from_slice(&data[0..7]);
                     ProtocolData::StreamFragment {
-                        sequence: data[0],
-                        data: s_data,
+                        data: f_data
                     }
                 }
+                StreamWrite => ProtocolData::Empty,
                 Ack => ProtocolData::Empty,
-                StartFwUpdate => ProtocolData::Empty,
-                FWUpdate => ProtocolData::Empty,
+                FirmwareUpdate => ProtocolData::Empty,
                 RevokeConfig => ProtocolData::RevokeConfig {
-                    device_id: data[0],
+                    serial_no: LittleEndian::read_u32(&data[0..4]),
                 },
                 NetworkReset => ProtocolData::Empty,
-                OverwriteUserStore => ProtocolData::Empty,
+                UserStoreUpdate => ProtocolData::Empty,
                 EraseUserStore => ProtocolData::Empty,
                 Error => {
                     if data.len() < 5 {
