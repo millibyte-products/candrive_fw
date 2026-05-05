@@ -197,6 +197,23 @@ pub fn fault_ok() -> bool {
     gpioa.idr.read().idr10().bit_is_set()
 }
 
+/// True when the gate driver is currently enabled (NRST high).
+#[inline]
+pub fn is_enabled() -> bool {
+    let gpioa = unsafe { &*pac::GPIOA::ptr() };
+    gpioa.odr.read().odr8().bit_is_set()
+}
+
+/// Read the most recently latched PWM duty cycles, expressed as
+/// `(ccr1, ccr2, ccr3)` in raw counter units (`0..=PWM_ARR`).
+#[inline]
+pub fn read_duty() -> (u16, u16, u16) {
+    let tim2 = unsafe { &*pac::TIM2::ptr() };
+    (tim2.ccr1().read().ccr().bits(),
+     tim2.ccr2().read().ccr().bits(),
+     tim2.ccr3().read().ccr().bits())
+}
+
 /// Enable TIM2 update-event interrupt and unmask it in the NVIC. Call
 /// once after `init()` and after the `#[interrupt] fn TIM2()` handler
 /// has been linked into the vector table.

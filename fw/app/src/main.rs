@@ -20,7 +20,7 @@ use candrive_shared::can_frame::CanFrame;
 use candrive_shared::common_api::{self, CommonApi};
 use candrive_shared::flash_layout::APP_BASE;
 use candrive_shared::identity::{self, build_reply};
-use candrive_shared::protocol::{Command, Message, ProtocolData, StatusBits};
+use candrive_shared::protocol::{Command, Message, MotorBits, ProtocolData, StatusBits};
 use candrive_shared::user_store::Slot;
 use cortex_m::peripheral::SCB;
 use cortex_m_rt::entry;
@@ -29,6 +29,7 @@ use stm32f1::stm32f103 as pac;
 use stm32f1::stm32f103::interrupt;
 use stm32f1 as _;
 
+mod analog;
 mod clocks;
 mod control;
 mod encoder;
@@ -37,6 +38,7 @@ mod iwdg;
 mod led;
 mod motor;
 mod motor_pwm;
+mod servo;
 mod spin_test;
 
 // Pre-PWM fallback heartbeat pin. Used only on the early-fault path
@@ -235,6 +237,82 @@ fn handle(api: &CommonApi, msg: Message, identity: &mut Slot) -> Action {
                         stat: led::get(led::LED_STAT),
                         update_flag: 0,
                     })),
+                Command::GetAnalog => {
+                    let (a0, a1) = analog::read();
+                    Action::reply(build_reply(identity.assigned_id, Command::GetAnalog,
+                        ProtocolData::Analog { a0, a1 }))
+                }
+                Command::SetServo => {
+                    if let ProtocolData::Servo { s0, s1, update_flag } = data {
+                        servo::apply_set(s0, s1, update_flag);
+                    }
+                    Action::reply(build_reply(identity.assigned_id, Command::SetServo,
+                        ProtocolData::Servo {
+                            s0: servo::get(servo::SRV0),
+                            s1: servo::get(servo::SRV1),
+                            update_flag: 0,
+                        }))
+                }
+                Command::GetServo => Action::reply(build_reply(identity.assigned_id, Command::GetServo,
+                    ProtocolData::Servo {
+                        s0: servo::get(servo::SRV0),
+                        s1: servo::get(servo::SRV1),
+                        update_flag: 0,
+                    })),
+                Command::GetMotor => {
+                    // value: not meaningful in the cascaded-control
+                    // architecture (use GetMotorParam instead). The
+                    // gate-driver state lives in rst/sleep.
+                    let en = motor_pwm::is_enabled();
+                    Action::reply(build_reply(identity.assigned_id, Command::GetMotor,
+                        ProtocolData::Motor(MotorBits { value: 0, rst: en, sleep: en })))
+                }
+                Command::SetMotor => {
+                    // rst & sleep both high → enable bridge; otherwise
+                    // disable. The new SetMotorCommand mode dispatch is
+                    // the right way to actually drive the motor; this
+                    // command is kept as a low-level safety override.
+                    if let ProtocolData::Motor(mb) = data {
+                        if mb.rst && mb.sleep {
+                            motor_pwm::set_enable(true);
+                        } else {
+                            motor_pwm::set_enable(false);
+                            // Force the controller back to Idle so it
+                            // doesn't keep re-asserting Vq while the
+                            // bridge is disabled.
+                            control::set_command(0, 0.0);
+                        }
+                    }
+                    let en = motor_pwm::is_enabled();
+                    Action::reply(build_reply(identity.assigned_id, Command::SetMotor,
+                        ProtocolData::Motor(MotorBits { value: 0, rst: en, sleep: en })))
+                }
+                Command::GetFoc => {
+                    // Report the most-recent applied phase duties, scaled
+                    // to 0..=255 for compactness on the wire. en mirrors
+                    // the gate driver state.
+                    let (a, b, c) = motor_pwm::read_duty();
+                    let scale = |v: u16| -> u8 {
+                        ((v as u32 * 255) / motor_pwm::PWM_ARR as u32) as u8
+                    };
+                    let en = if motor_pwm::is_enabled() { 1 } else { 0 };
+                    Action::reply(build_reply(identity.assigned_id, Command::GetFoc,
+                        ProtocolData::Foc { foc_1: scale(a), foc_2: scale(b),
+                                            foc_3: scale(c), en }))
+                }
+                Command::SetFoc => {
+                    // Diagnostic-only: don't let the host inject raw
+                    // phase voltages — that bypasses the FOC math.
+                    // Echo back the current duties as a SetFoc reply.
+                    let (a, b, c) = motor_pwm::read_duty();
+                    let scale = |v: u16| -> u8 {
+                        ((v as u32 * 255) / motor_pwm::PWM_ARR as u32) as u8
+                    };
+                    let en = if motor_pwm::is_enabled() { 1 } else { 0 };
+                    Action::reply(build_reply(identity.assigned_id, Command::SetFoc,
+                        ProtocolData::Foc { foc_1: scale(a), foc_2: scale(b),
+                                            foc_3: scale(c), en }))
+                }
                 _ => Action::reply(build_reply(identity.assigned_id, Command::Ack, ProtocolData::Empty)),
             }
         }
@@ -339,6 +417,8 @@ fn main() -> ! {
     // motor_pwm::init programs SWJ_CFG=010 (JTAG off, SWD on) which
     // frees PB4 (JTRST) for AF use. led::init must run after that.
     led::init();
+    servo::init();
+    analog::init();
     // Synchronize encoder sampling + control step to the TIM2 update
     // event. The handler (#[interrupt] fn TIM2 below) divides the
     // 50 kHz PWM update rate down to a deterministic control-loop

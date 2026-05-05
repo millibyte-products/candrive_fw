@@ -386,7 +386,7 @@ fn decode_data(cmd: Command, is_controller: bool, b: &[u8]) -> Result<ProtocolDa
     use ProtocolData::*;
     let need = |n: usize| if b.len() < n { Err(DecodeError::Truncated) } else { Ok(()) };
     Ok(match cmd {
-        Noop | SetServo | Ack | FirmwareUpdate | UserStoreUpdate
+        Noop | Ack | FirmwareUpdate | UserStoreUpdate
         | EraseUserStore | NetworkReset | SaveMotorParams => Empty,
         StreamWrite => {
             // Final fragment may be short — pad with 0xFF and rely on the
@@ -402,7 +402,7 @@ fn decode_data(cmd: Command, is_controller: bool, b: &[u8]) -> Result<ProtocolDa
         GetPosition | SetPosition => { need(2)?; Position { value: get_u16(&b[0..2]) } }
         GetStatus => { need(1)?; Status(StatusBits::from_byte(b[0])) }
         GetAnalog => { need(4)?; Analog { a0: get_u16(&b[0..2]), a1: get_u16(&b[2..4]) } }
-        GetServo  => { need(5)?; Servo { s0: get_u16(&b[0..2]), s1: get_u16(&b[2..4]),
+        GetServo | SetServo => { need(5)?; Servo { s0: get_u16(&b[0..2]), s1: get_u16(&b[2..4]),
             update_flag: b[4] } }
         GetLed | SetLed => { need(3)?; Led { sys: b[0], stat: b[1], update_flag: b[2] } }
         GetMotor | SetMotor => Motor(MotorBits::from_bytes(b)?),
