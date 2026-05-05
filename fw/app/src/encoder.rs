@@ -13,6 +13,13 @@
 //!
 //! Mode: SPI mode 0 (CPOL=0, CPHA=0), 1 MHz (matches legacy).
 //! APB2 = 64 MHz so prescaler /64 yields exactly 1 MHz on SCK.
+//!
+//! Note: the MT6701 datasheet calls for SPI mode 2 with a 25-bit frame,
+//! but mode 2 with the leading-dummy-bit interpretation produces angle
+//! data with worse stability on this hardware (validated 6 May 2026).
+//! Mode 0 yields good angle data; the CRC field consistently mismatches
+//! (cosmetic only — the per-tick glitch filter in control::step rejects
+//! the rare bad sample that does slip through).
 
 use stm32f1::stm32f103 as pac;
 
