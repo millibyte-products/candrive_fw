@@ -445,6 +445,335 @@ def run_openocd_program(stlink_serial: str,
         "exit",
     ], timeout_s=timeout_s)
 
+# --- Per-stage program-and-verify with a progress bar ------------------------
+
+@dataclass(frozen=True)
+class FlashStage:
+    name: str
+    path: Path  # source bin
+    addr: int
+    size: int   # bytes — used for the progress bar weighting
+
+# Markers OpenOCD prints around `program ... verify`.
+_PROG_START_RE  = re.compile(r"^\*\* Programming Started \*\*", re.M)
+_PROG_DONE_RE   = re.compile(r"^\*\* Programming Finished \*\*", re.M)
+_VERIFY_OK_RE   = re.compile(r"^\*\* Verified OK \*\*", re.M)
+_VERIFY_FAIL_RE = re.compile(r"^\*\* Verify Failed \*\*", re.M)
+_VERIFY_START_RE= re.compile(r"^\*\* Verify Started \*\*", re.M)
+
+class _Bar:
+    """Tiny stage progress bar rendered on stderr (fall back to plain
+    text when not a TTY)."""
+    WIDTH = 28
+    def __init__(self, stages: list[FlashStage]):
+        self.stages = stages
+        self.tty = sys.stderr.isatty()
+        self.done = 0
+        self.cur: Optional[str] = None
+        self.cur_phase: str = ""
+        self.t0 = time.monotonic()
+        self.last_render = 0.0
+    def start(self, name: str) -> None:
+        self.cur = name; self.cur_phase = "program"; self._render(force=True)
+    def phase(self, ph: str) -> None:
+        self.cur_phase = ph; self._render(force=True)
+    def finish(self, name: str, ok_: bool, ms: int) -> None:
+        if ok_:
+            self.done += 1
+        # Always print a stable, scrollback-friendly summary line.
+        marker = _c("green","✓") if ok_ else _c("red","✗")
+        msg = (f"  [{self.done}/{len(self.stages)}] {marker} "
+               f"{name:<11} {ms:>5} ms  "
+               f"({self._fmt_size(self._stage(name).size)})")
+        if self.tty:
+            sys.stderr.write("\r\033[K" + msg + "\n")
+        else:
+            sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+        self.cur = None
+        self._render(force=True)
+    def _stage(self, name: str) -> FlashStage:
+        return next(s for s in self.stages if s.name == name)
+    def _fmt_size(self, n: int) -> str:
+        return f"{n} B" if n < 1024 else f"{n/1024:.1f} KiB"
+    def _render(self, *, force: bool=False) -> None:
+        if not self.tty:
+            if self.cur and force:
+                sys.stderr.write(
+                    f"  [{self.done+1}/{len(self.stages)}] {self.cur} "
+                    f"({self.cur_phase})…\n")
+                sys.stderr.flush()
+            return
+        now = time.monotonic()
+        if not force and (now - self.last_render) < 0.05:
+            return
+        self.last_render = now
+        # Compute fractional progress: completed stages plus 0.5 if
+        # currently programming and 0.9 if verifying.
+        pos = float(self.done)
+        if self.cur is not None:
+            pos += 0.5 if self.cur_phase == "program" else \
+                   0.9 if self.cur_phase == "verify"  else 0.1
+        frac = min(1.0, pos / max(1, len(self.stages)))
+        filled = int(round(frac * self.WIDTH))
+        bar = "█"*filled + "░"*(self.WIDTH-filled)
+        elapsed = now - self.t0
+        cur_label = (f" — {self.cur} ({self.cur_phase})"
+                     if self.cur else "")
+        sys.stderr.write(
+            f"\r  [{bar}] {int(frac*100):3d}%  {elapsed:4.1f}s{cur_label}"
+            "\033[K")
+        sys.stderr.flush()
+    def end(self) -> None:
+        if self.tty:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+
+def flash_with_progress(stlink_serial: str,
+                         user_store_bin: Path,
+                         *,
+                         timeout_s: float = 60.0,
+                         verbose: bool = False
+                         ) -> tuple[bool, str, dict[str, int]]:
+    """Run a single OpenOCD session that programs+verifies all four
+    regions, streaming the output so we can render per-stage progress
+    and capture per-stage timings.
+
+    Returns ``(ok, full_log, per_stage_ms)``.
+    """
+    stages = [
+        FlashStage("bootloader", BOOTLOADER_BIN, ADDR_BOOTLOADER,
+                   BOOTLOADER_BIN.stat().st_size),
+        FlashStage("common",     COMMON_BIN,     ADDR_COMMON,
+                   COMMON_BIN.stat().st_size),
+        FlashStage("user_store", user_store_bin, ADDR_USER_STORE,
+                   USER_STORE_SIZE),
+        FlashStage("app",        APP_BIN,        ADDR_APP,
+                   APP_BIN.stat().st_size),
+    ]
+
+    argv = [OPENOCD, "-f", INTERFACE_CFG]
+    if stlink_serial:
+        argv += ["-c", f"adapter serial {stlink_serial}"]
+    argv += ["-f", TARGET_CFG]
+    # Issue each program separately so OpenOCD prints per-stage
+    # ** Programming Started/Finished ** + ** Verify ** markers we
+    # can latch onto. After all stages, leave the device running.
+    argv += ["-c", "init"]
+    for s in stages:
+        argv += ["-c", f"echo \"@@STAGE {s.name}\""]
+        argv += ["-c", f"program {s.path} 0x{s.addr:08x} verify"]
+    argv += ["-c", "reset run", "-c", "exit"]
+
+    bar = _Bar(stages)
+    info("flashing 4 regions:")
+    if not bar.tty:
+        for s in stages:
+            info(f"    {s.name:<11} @ 0x{s.addr:08x}  ({bar._fmt_size(s.size)})")
+
+    log_lines: list[str] = []
+    per_stage_ms: dict[str, int] = {}
+    cur: Optional[str] = None
+    stage_t0: float = 0.0
+    saw_verify_start = False
+    saw_verify_ok    = False
+    failed_stage: Optional[str] = None
+
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                bufsize=1)
+    except FileNotFoundError as e:
+        return False, str(e), {}
+
+    deadline = time.monotonic() + timeout_s
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log_lines.append(line)
+            if verbose:
+                sys.stderr.write(line)
+            if time.monotonic() > deadline:
+                proc.kill()
+                bar.end()
+                return False, "".join(log_lines) + "\n[timeout]", per_stage_ms
+            # Stage transition.
+            m = re.match(r"@@STAGE (\S+)", line)
+            if m:
+                cur = m.group(1)
+                stage_t0 = time.monotonic()
+                saw_verify_start = False
+                saw_verify_ok    = False
+                bar.start(cur)
+                continue
+            if cur is None:
+                continue
+            if _PROG_START_RE.search(line):
+                bar.phase("program")
+            elif _PROG_DONE_RE.search(line):
+                bar.phase("verify")
+            elif _VERIFY_START_RE.search(line):
+                saw_verify_start = True
+                bar.phase("verify")
+            elif _VERIFY_OK_RE.search(line):
+                saw_verify_ok = True
+                ms = int((time.monotonic() - stage_t0) * 1000)
+                per_stage_ms[cur] = ms
+                bar.finish(cur, True, ms)
+                cur = None
+            elif _VERIFY_FAIL_RE.search(line):
+                ms = int((time.monotonic() - stage_t0) * 1000)
+                per_stage_ms[cur] = ms
+                bar.finish(cur, False, ms)
+                failed_stage = cur
+                cur = None
+        proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        bar.end()
+        return False, "".join(log_lines) + "\n[timeout]", per_stage_ms
+    finally:
+        bar.end()
+
+    full = "".join(log_lines)
+    if failed_stage is not None:
+        err(f"verify failed during {failed_stage} stage")
+        return False, full, per_stage_ms
+    if proc.returncode != 0:
+        err(f"openocd exited with code {proc.returncode}")
+        return False, full, per_stage_ms
+    # Sanity: did every stage print a Verified OK?
+    if len(per_stage_ms) != len(stages):
+        missing = [s.name for s in stages if s.name not in per_stage_ms]
+        err(f"missing verify confirmation for stages: {missing}")
+        return False, full, per_stage_ms
+    return True, full, per_stage_ms
+
+
+# --- CAN-side post-flash verification ----------------------------------------
+
+# Mirrors the constants in tools/motor_cli.py so we don't add a new
+# dep. If/when the CAN protocol grows past these, share them via a
+# small module.
+CAN_DEVICE_BASE          = 0x008
+CAN_ID_DISCOVERY_REQ     = 0x002
+CAN_ID_DISCOVERY_ASSIGN  = 0x001
+CONTROLLER_BIT           = 0x80
+CMD_GET_INFO             = 0x01
+CMD_GET_STATUS           = 0x05
+DEFAULT_DEV_ID           = 5
+
+
+def verify_can_boot(expected_serial: int,
+                     *,
+                     iface: str = "can0",
+                     timeout: float = 6.0,
+                     dev_id: int = DEFAULT_DEV_ID,
+                     verbose: bool = False
+                     ) -> tuple[bool, dict]:
+    """Listen on `iface` for the freshly flashed device to announce
+    itself, then probe whether it's the bootloader or the app.
+
+    Returns ``(ok, info_dict)`` where info_dict carries:
+        seen_serial, image ('app'/'bootloader'/'unknown'),
+        fw_major, fw_minor, fw_patch, log (list[str]).
+    """
+    import socket
+    log: list[str] = []
+    out = {"seen_serial": None, "image": "unknown",
+           "fw_major": None, "fw_minor": None, "fw_patch": None,
+           "log": log}
+    try:
+        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        s.bind((iface,))
+        s.settimeout(0.1)
+    except OSError as e:
+        log.append(f"can socket setup failed: {e}")
+        return False, out
+
+    def _send(can_id: int, data: bytes) -> None:
+        assert len(data) <= 8
+        s.send(struct.pack("=IB3x8s", can_id, len(data),
+                           data + b"\x00"*(8-len(data))))
+
+    def _recv(deadline: float):
+        while time.monotonic() < deadline:
+            try:
+                raw = s.recv(16)
+            except socket.timeout:
+                continue
+            cid, dlc, _, _, _, payload = struct.unpack("=IBBBB8s", raw)
+            return cid & 0x7FF, payload[:dlc]
+        return None
+
+    deadline = time.monotonic() + timeout
+    info(f"waiting up to {timeout:.1f}s for DiscoveryReq on {iface}…")
+    seen = None
+    while time.monotonic() < deadline:
+        f = _recv(deadline)
+        if f is None:
+            break
+        cid, data = f
+        if cid == CAN_ID_DISCOVERY_REQ and len(data) == 5:
+            ser = struct.unpack("<I", data[:4])[0]
+            prev = data[4]
+            log.append(f"DiscoveryReq serial=0x{ser:08X} prev_id={prev}")
+            if verbose:
+                info(f"  rx DiscoveryReq serial=0x{ser:08X} prev_id={prev}")
+            if ser == expected_serial:
+                seen = ser; break
+            # First DiscoveryReq from a different unit — log and keep
+            # listening; the CAN bus may carry chatter from another
+            # device on the same harness.
+    if seen is None:
+        s.close()
+        log.append("no DiscoveryReq with expected serial seen")
+        return False, out
+    out["seen_serial"] = seen
+
+    # Bind it at dev_id so GetInfo/GetStatus can be addressed.
+    _send(CAN_ID_DISCOVERY_ASSIGN, struct.pack("<IB", seen, dev_id))
+    time.sleep(0.05)
+    # GetInfo
+    _send(CAN_DEVICE_BASE + dev_id, bytes([CMD_GET_INFO | CONTROLLER_BIT]))
+    deadline2 = time.monotonic() + 1.5
+    info_reply: Optional[bytes] = None
+    while time.monotonic() < deadline2:
+        f = _recv(deadline2)
+        if f is None: break
+        cid, data = f
+        if cid == CAN_DEVICE_BASE + dev_id and len(data) >= 1 \
+           and (data[0] & 0x7F) == CMD_GET_INFO:
+            info_reply = data; break
+    if info_reply is None:
+        s.close()
+        log.append("DiscoveryReq seen but GetInfo did not reply")
+        # It booted at least far enough to broadcast — not a total
+        # failure, but flag it.
+        return False, out
+    if len(info_reply) >= 8:
+        out["fw_major"] = info_reply[5]
+        out["fw_minor"] = info_reply[6]
+        out["fw_patch"] = info_reply[7]
+    # Probe app-only command to discriminate.
+    _send(CAN_DEVICE_BASE + dev_id,
+          bytes([CMD_GET_STATUS | CONTROLLER_BIT, 0]))
+    deadline3 = time.monotonic() + 0.6
+    is_app = False
+    while time.monotonic() < deadline3:
+        f = _recv(deadline3)
+        if f is None: break
+        cid, data = f
+        if cid == CAN_DEVICE_BASE + dev_id and len(data) >= 1 \
+           and (data[0] & 0x7F) == CMD_GET_STATUS:
+            is_app = True; break
+    out["image"] = "app" if is_app else "bootloader"
+    log.append(f"image={out['image']} "
+               f"fw=v{out['fw_major']}.{out['fw_minor']}.{out['fw_patch']}")
+    s.close()
+    return True, out
+
 # --- Flash one device --------------------------------------------------------
 
 def select_stlink(arg: Optional[str]) -> StLink:
@@ -507,8 +836,11 @@ def cmd_flash(args: argparse.Namespace) -> int:
         tf.write(user_store_page)
         tmp_path = Path(tf.name)
     try:
-        ok_, log = run_openocd_program(link.serial, tmp_path,
-                                       timeout_s=args.openocd_timeout)
+        ok_, log, stage_ms = flash_with_progress(
+            link.serial, tmp_path,
+            timeout_s=args.openocd_timeout,
+            verbose=args.verbose,
+        )
     finally:
         with contextlib.suppress(OSError):
             tmp_path.unlink()
@@ -519,12 +851,41 @@ def cmd_flash(args: argparse.Namespace) -> int:
         tail = "\n".join(log.splitlines()[-30:]) if log else "<no openocd output>"
         finalize_failed(db, serial, duration_ms=dt_ms,
                         error=tail[-3500:])
-        err(f"OpenOCD failed for serial {serial:#010x} after {dt_ms} ms")
+        err(f"OpenOCD failed for serial {serial:#010x} after {dt_ms} ms "
+            f"(stages ok: {sorted(stage_ms.keys())})")
         if args.verbose:
             print(log, file=sys.stderr)
         else:
             print(_c("dim", tail), file=sys.stderr)
         return 2
+
+    ok(f"all 4 regions programmed and verified by OpenOCD in {dt_ms} ms")
+
+    # CAN-side liveness check: did the chip actually boot, and is the
+    # serial we just wrote the one being broadcast?
+    can_ok, can_info = verify_can_boot(serial,
+                                       iface=getattr(args, "can_iface",
+                                                     "can0"),
+                                       timeout=getattr(args, "can_timeout",
+                                                       6.0),
+                                       verbose=args.verbose)
+    if not can_ok:
+        msg = ("flashed OK over SWD but no DiscoveryReq with serial "
+               f"0x{serial:08X} on {getattr(args,'can_iface','can0')} "
+               f"within {getattr(args,'can_timeout',6.0):.1f}s")
+        finalize_failed(db, serial, duration_ms=dt_ms,
+                        error=msg + "\n" + "\n".join(can_info["log"]))
+        err(msg)
+        for ln in can_info["log"]:
+            print(_c("dim", "    " + ln), file=sys.stderr)
+        return 5
+
+    image = can_info["image"]
+    fw    = (f"v{can_info['fw_major']}.{can_info['fw_minor']}."
+             f"{can_info['fw_patch']}"
+             if can_info["fw_major"] is not None else "?")
+    ok(f"device booted: image={_c('bold', image)}  fw={fw}  "
+       f"serial=0x{serial:08X}")
 
     finalize_ok(db, serial, duration_ms=dt_ms,
                 bootloader_sha=sha256_file(BOOTLOADER_BIN),
@@ -708,6 +1069,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--openocd-timeout", type=float, default=60.0)
     sp.add_argument("--uid-timeout", type=float, default=10.0,
                     help="seconds to wait for the STM32 UID readback")
+    sp.add_argument("--can-iface", default="can0",
+                    help="SocketCAN interface for the post-flash boot "
+                    "verify (default can0)")
+    sp.add_argument("--can-timeout", type=float, default=6.0,
+                    help="seconds to wait for a DiscoveryReq with the "
+                    "freshly written serial (default 6.0)")
     sp.add_argument("--force", action="store_true",
                     help="re-flash even if this STM32 UID is already "
                     "recorded as 'ok' (allocates a new serial)")
@@ -720,6 +1087,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--operator")
     sp.add_argument("--openocd-timeout", type=float, default=60.0)
     sp.add_argument("--uid-timeout", type=float, default=10.0)
+    sp.add_argument("--can-iface", default="can0")
+    sp.add_argument("--can-timeout", type=float, default=6.0)
     sp.add_argument("--poll-interval", type=float, default=1.0,
                     help="seconds between SWD UID polls (default 1.0)")
     sp.add_argument("--absent-polls", type=int, default=2,
