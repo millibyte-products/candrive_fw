@@ -103,6 +103,27 @@ Python wrappers (`motor_cli.py`, `fw_update.py`, `position_battery.py`,
 
 CAN bus: 1 Mbit/s, default device ID 1.
 
+## Production flashing
+
+For programming new units on the bench (bootloader + common + app +
+a freshly allocated serial number written into `USER_STORE`), use:
+
+```sh
+sudo ./tools/production_flash.py monitor
+```
+
+It watches USB for ST-Link insertions and runs one full SWD flash per
+freshly attached adapter. Each unit's serial, image hashes, git SHA,
+operator, and timestamp are recorded in the SQLite database at
+`/mnt/bulk/backup/documents/candrive_fw_serials_prod.db` (override with
+`--db`). One-shot mode (`flash`), record listing (`list`/`show`), and
+a `preview` command that prints the user_store bytes for a given serial
+without flashing or DB writes are also available.
+
+The user_store record format mirrors `fw/shared/src/user_store.rs`:
+28-byte slot with magic `"USRC"`, serial number, and a CRC-32/MPEG-2
+checksum, padded with `0xFF` to fill the 1 KiB flash page.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push to `main` and on every
