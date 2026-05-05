@@ -115,6 +115,14 @@ fn handle(api: &CommonApi, msg: Message, identity: &mut Slot) -> Action {
                     ProtocolData::InfoExt { flags: 0, temperature: 0 })),
                 Command::GetStatus => Action::reply(build_reply(identity.assigned_id, Command::GetStatus,
                     ProtocolData::Status(StatusBits::default()))),
+                Command::GetPosition => {
+                    // Single-turn 14-bit angle (0..16383). The
+                    // multi-turn accumulator is exposed via
+                    // GetMotorParam(132) for callers that need it.
+                    let angle = encoder::last_sample().map(|s| s.angle).unwrap_or(0);
+                    Action::reply(build_reply(identity.assigned_id, Command::GetPosition,
+                        ProtocolData::Position { value: angle }))
+                }
                 Command::FirmwareUpdate => Action {
                     reply: Some(build_reply(identity.assigned_id, Command::Ack, ProtocolData::Empty)),
                     reboot_into_bl: true,

@@ -31,6 +31,8 @@ CMD_SAVE_MOTOR_PARAMS = 0x24
 CMD_GET_LED = 0x09
 CMD_SET_LED = 0x0A
 
+CMD_GET_POSITION = 0x03
+
 # `update_flag` bits in the SetLed payload.
 LED_UPDATE_STAT = 0x01
 LED_UPDATE_SYS  = 0x02
@@ -178,6 +180,18 @@ def cmd_set_led(s: socket.socket, sys_duty: int, stat_duty: int, mask: int) -> N
     print(f"sys={sys_d}% stat={stat_d}%")
 
 
+def cmd_get_position(s: socket.socket) -> None:
+    # Payload is required to be 2 bytes by the firmware decoder.
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_POSITION | CONTROLLER_BIT, 0, 0]))
+    r = expect_reply(s, CMD_GET_POSITION)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    counts = r[1] | (r[2] << 8)
+    rad = (counts / 16384.0) * 2.0 * 3.141592653589793
+    print(f"angle_counts={counts} angle_rad={rad:.4f}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iface", default="can0")
@@ -202,13 +216,14 @@ def main() -> None:
     sub.add_parser("save-params", help="commit current motor params to flash")
 
     sub.add_parser("get-led", help="read SYS+STAT LED duty cycles")
-
     sl = sub.add_parser("set-led", help="set SYS+STAT LED duty cycles (0..100)")
     sl.add_argument("--sys",  type=int, default=0, help="SYS duty 0..100")
     sl.add_argument("--stat", type=int, default=0, help="STAT duty 0..100")
     sl.add_argument("--mask", type=lambda v: int(v, 0), default=None,
                     help="update_flag override (default: bits set for whichever "
                          "of --sys / --stat were given)")
+
+    sub.add_parser("get-position", help="read single-turn encoder angle (counts + rad)")
 
     args = p.parse_args()
     s = open_can(args.iface)
@@ -236,6 +251,8 @@ def main() -> None:
         else:
             mask = args.mask
         cmd_set_led(s, args.sys, args.stat, mask)
+    elif args.cmd == "get-position":
+        cmd_get_position(s)
 
 
 if __name__ == "__main__":
