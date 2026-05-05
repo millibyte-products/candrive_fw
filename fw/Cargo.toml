@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["shared", "common", "bootloader", "app"]
+
+# Default profile for firmware: small, no panic strings, LTO across crates.
+[profile.release]
+opt-level   = "s"
+lto         = "fat"
+codegen-units = 1
+panic       = "abort"
+debug       = true       # keep DWARF in the ELF (stripped from .bin/.hex by objcopy)
+overflow-checks = false
+strip       = false
+
+[profile.dev]
+opt-level   = 1          # 0 produces giant binaries that don't fit our 4K bootloader
+panic       = "abort"
+debug       = true
+overflow-checks = true
+incremental = true
