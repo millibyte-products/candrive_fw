@@ -347,6 +347,100 @@ def cmd_revoke_config(s: socket.socket, serial_no: int) -> None:
     print(f"acked: 0x{r[0]:02x}")
 
 
+# --- Quick post-flash bring-up verifier --------------------------------------
+
+CMD_GET_INFO     = 0x01
+
+CAN_ID_DISCOVERY_ASSIGN = 0x001
+CAN_ID_DISCOVERY_REQ    = 0x002
+
+
+def _expect_reply_on(s: socket.socket, dev_id: int, cmd: int,
+                     timeout: float):
+    """Like expect_reply() but parameterised by device id (not the
+    module-level DEV_ID)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        f = recv(s, deadline - time.monotonic())
+        if f is None:
+            continue
+        cid, data = f
+        if cid == CAN_DEVICE_BASE + dev_id and len(data) >= 1:
+            if (data[0] & 0x7F) == cmd:
+                return data
+    return None
+
+
+def cmd_verify(s: socket.socket, *, dev_id: int, listen_for: float,
+               expect_serial: int | None) -> int:
+    """Quick post-flash verification: assign + GetInfo + GetStatus.
+
+    If `listen_for > 0`, first watch the bus for a DiscoveryReq from a
+    freshly booted device to learn its serial. Otherwise assume the
+    device is already discovered at `dev_id`.
+
+    Distinguishes app vs bootloader by probing GetStatus after GetInfo:
+    the bootloader doesn't implement GetStatus, so a timeout there
+    means we're talking to the bootloader.
+    """
+    serial: int | None = None
+    if listen_for > 0:
+        print(f"[*] listening {listen_for:.1f}s for DiscoveryReq on can …")
+        deadline = time.monotonic() + listen_for
+        while time.monotonic() < deadline:
+            f = recv(s, deadline - time.monotonic())
+            if f is None:
+                continue
+            cid, data = f
+            if cid == CAN_ID_DISCOVERY_REQ and len(data) == 5:
+                serial = struct.unpack("<I", data[:4])[0]
+                prev_id = data[4]
+                print(f"    DiscoveryReq: serial=0x{serial:08X} "
+                      f"prev_id={prev_id}")
+                break
+        if serial is None and expect_serial is None:
+            print("[!] no DiscoveryReq seen; assuming device is already "
+                  f"assigned at id {dev_id}")
+
+    # Assign if we have a serial. (Idempotent: re-assigning the same
+    # serial+id is a no-op for the device.)
+    if serial is not None or expect_serial is not None:
+        the_serial = serial if serial is not None else expect_serial
+        send(s, CAN_ID_DISCOVERY_ASSIGN,
+             struct.pack("<IB", the_serial & 0xFFFFFFFF, dev_id))
+        time.sleep(0.05)
+
+    # GetInfo. Wire payload is empty (firmware ignores trailing bytes).
+    send(s, CAN_DEVICE_BASE + dev_id,
+         bytes([CMD_GET_INFO | CONTROLLER_BIT]))
+    r = _expect_reply_on(s, dev_id, CMD_GET_INFO, timeout=1.5)
+    if r is None:
+        print(f"[x] no GetInfo reply from device id {dev_id} — not on bus, "
+              "wrong id, or unassigned")
+        return 2
+    if len(r) < 8:
+        print(f"[x] short GetInfo reply: {r.hex()}")
+        return 2
+    rep_serial = struct.unpack("<I", r[1:5])[0]
+    fw_major, fw_minor, fw_patch = r[5], r[6], r[7]
+
+    # Probe for app-only command to distinguish app vs bootloader.
+    send(s, CAN_DEVICE_BASE + dev_id,
+         bytes([CMD_GET_STATUS | CONTROLLER_BIT, 0]))
+    status_reply = _expect_reply_on(s, dev_id, CMD_GET_STATUS, timeout=0.5)
+    image = "app" if status_reply is not None else "bootloader"
+
+    print(f"[+] device id={dev_id}  serial=0x{rep_serial:08X}  "
+          f"fw=v{fw_major}.{fw_minor}.{fw_patch}  image={image}")
+
+    rc = 0
+    if expect_serial is not None and rep_serial != expect_serial:
+        print(f"[!] serial mismatch: expected 0x{expect_serial:08X}, "
+              f"got 0x{rep_serial:08X}")
+        rc = 3
+    return rc
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iface", default="can0")
@@ -404,6 +498,17 @@ def main() -> None:
     rc = sub.add_parser("revoke-config", help="reset id only; --serial must match this device")
     rc.add_argument("--serial", type=lambda v: int(v, 0), required=True,
                     help="device serial_no (factory default 0xCAFEBABE)")
+
+    vfy = sub.add_parser("verify",
+        help="post-flash sanity: discover (or assume), GetInfo, probe app vs bootloader")
+    vfy.add_argument("--device-id", type=int, default=DEV_ID,
+                     help=f"CAN device id to assign / query (default {DEV_ID})")
+    vfy.add_argument("--listen", type=float, default=3.0,
+                     help="seconds to wait for a DiscoveryReq before falling "
+                     "back to assuming an already-assigned device (default 3)")
+    vfy.add_argument("--expect-serial", type=lambda v: int(v, 0),
+                     help="if given, fail with rc=3 unless GetInfo reports "
+                     "this serial (matches what production_flash.py wrote)")
 
     args = p.parse_args()
     s = open_can(args.iface)
@@ -464,6 +569,12 @@ def main() -> None:
         cmd_erase_user_store(s)
     elif args.cmd == "revoke-config":
         cmd_revoke_config(s, args.serial)
+    elif args.cmd == "verify":
+        rc = cmd_verify(s,
+                        dev_id=args.device_id,
+                        listen_for=args.listen,
+                        expect_serial=args.expect_serial)
+        sys.exit(rc)
 
 
 if __name__ == "__main__":
