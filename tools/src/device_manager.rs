@@ -542,17 +542,18 @@ impl DeviceManager {
                 DeviceManager::device_query(&mut db, id, Commands::GetStatus, ProtocolData::Empty)
             },
             LocalCommands::SetSysLed(id, value) => {
+                // update_flag bit 1 = update SYS, bit 0 = update STAT.
                 DeviceManager::device_query(&mut db, id, Commands::SetLed, ProtocolData::Led {
                     sys: value,
                     stat: 0,
-                    update_flag: 0x01
+                    update_flag: 0x02
                 })
             },
             LocalCommands::SetStatLed(id, value) => {
                 DeviceManager::device_query(&mut db, id, Commands::SetLed, ProtocolData::Led {
                     sys: 0,
                     stat: value,
-                    update_flag: 0x02
+                    update_flag: 0x01
                 })
             }
             LocalCommands::GetLeds(id) => {

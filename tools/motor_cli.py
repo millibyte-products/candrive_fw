@@ -28,6 +28,13 @@ CMD_RUN_CALIBRATION = 0x22
 CMD_SET_MOTOR_COMMAND = 0x23
 CMD_SAVE_MOTOR_PARAMS = 0x24
 
+CMD_GET_LED = 0x09
+CMD_SET_LED = 0x0A
+
+# `update_flag` bits in the SetLed payload.
+LED_UPDATE_STAT = 0x01
+LED_UPDATE_SYS  = 0x02
+
 DEV_ID = 5
 
 
@@ -148,6 +155,29 @@ def cmd_move(s: socket.socket, mode: str, target: float) -> None:
     print(f"mode={mode_r} target={target_r}")
 
 
+def cmd_get_led(s: socket.socket) -> None:
+    # GetLed / SetLed share the 3-byte Led payload format on the wire;
+    # firmware decoder requires the full 3 bytes even on a query.
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_LED | CONTROLLER_BIT, 0, 0, 0]))
+    r = expect_reply(s, CMD_GET_LED)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    sys_duty, stat_duty, flag = r[1], r[2], r[3]
+    print(f"sys={sys_duty}% stat={stat_duty}% update_flag=0x{flag:02x}")
+
+
+def cmd_set_led(s: socket.socket, sys_duty: int, stat_duty: int, mask: int) -> None:
+    payload = bytes([sys_duty & 0xFF, stat_duty & 0xFF, mask & 0xFF])
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_SET_LED | CONTROLLER_BIT]) + payload)
+    r = expect_reply(s, CMD_SET_LED)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    sys_d, stat_d = r[1], r[2]
+    print(f"sys={sys_d}% stat={stat_d}%")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iface", default="can0")
@@ -171,6 +201,15 @@ def main() -> None:
 
     sub.add_parser("save-params", help="commit current motor params to flash")
 
+    sub.add_parser("get-led", help="read SYS+STAT LED duty cycles")
+
+    sl = sub.add_parser("set-led", help="set SYS+STAT LED duty cycles (0..100)")
+    sl.add_argument("--sys",  type=int, default=0, help="SYS duty 0..100")
+    sl.add_argument("--stat", type=int, default=0, help="STAT duty 0..100")
+    sl.add_argument("--mask", type=lambda v: int(v, 0), default=None,
+                    help="update_flag override (default: bits set for whichever "
+                         "of --sys / --stat were given)")
+
     args = p.parse_args()
     s = open_can(args.iface)
     if args.cmd == "get-param":
@@ -183,6 +222,20 @@ def main() -> None:
         cmd_move(s, args.mode, args.target)
     elif args.cmd == "save-params":
         cmd_save_params(s)
+    elif args.cmd == "get-led":
+        cmd_get_led(s)
+    elif args.cmd == "set-led":
+        if args.mask is None:
+            mask = 0
+            # Build the mask from whichever flags were supplied on the CLI.
+            argv = sys.argv
+            if any(a.startswith("--sys")  for a in argv): mask |= LED_UPDATE_SYS
+            if any(a.startswith("--stat") for a in argv): mask |= LED_UPDATE_STAT
+            if mask == 0:
+                mask = LED_UPDATE_SYS | LED_UPDATE_STAT
+        else:
+            mask = args.mask
+        cmd_set_led(s, args.sys, args.stat, mask)
 
 
 if __name__ == "__main__":
