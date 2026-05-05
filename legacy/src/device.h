@@ -9,8 +9,9 @@
  * this file. If not, please visit : github.com/millibyte/candrive-fw
  */
 
-#include <Arduino.h>
 #include <stdint.h>
+
+#include "protocol.h"
 
 // Physical parameters
 #define MOTOR_SUPPLY_VOLTAGE (12.0f)
@@ -51,6 +52,11 @@
 #define PWMCHANNEL(x) STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(x)))
 #define INVALID_DEVICE (-1)
 
+#define LED_DUTY_DEFAULT (25)
+#define FOC_PWM_FREQ (50000)
+
+#define DISCOVERY_INTERVAL_MS (15000)
+
 typedef enum
 {
     RESET_REASON_UNKNOWN = 0,
@@ -63,20 +69,41 @@ typedef enum
     RESET_REASON_BROWNOUT_RESET,
 } reset_reason_t;
 
-void init_device();
-int16_t get_device_id();
-void set_device_id(int16_t value);
-uint32_t get_serial_no();
-uint8_t get_fw_major();
-uint8_t get_fw_minor();
-uint8_t get_fw_patch();
-// Seconds since epoch
-uint64_t get_build_ts();
-// 20 bytes for git sha1
-const uint8_t* get_build_commit();
-uint8_t get_protocol_ver();
-uint8_t get_hw_ver();
-reset_reason_t get_last_reset_reason(void);
+typedef enum
+{
+    OPERATING_MODE_DISCOVERY = 0,
+    OPERATING_MODE_CONTROL,
+} operating_mode_t;
 
+void device_init();
+void device_update();
+void reset_interfaces();
+
+int16_t device_id_get();
+int16_t cached_id_get();
+void device_id_set(int16_t value);
+void cached_id_set(int16_t value);
+uint32_t serial_no_get();
+uint8_t fw_major_get();
+uint8_t fw_minor_get();
+uint8_t fw_patch_get();
+
+// Build info
+uint64_t build_ts_get();
+const uint8_t *build_commit_get(); // 20 bytes for git sha1
+uint8_t protocol_ver_get();
+uint8_t hw_ver_get();
+
+reset_reason_t reset_reason_get(void);
+
+// Device control
+void operating_mode_set(operating_mode_t mode);
+operating_mode_t operating_mode_get();
+
+void servo_set(servo_address_t s, uint16_t duty);
+uint16_t servo_get(servo_address_t s);
+
+void led_set(led_address_t l, uint8_t duty);
+uint8_t led_get(led_address_t l);
 
 #endif // _DEVICE_H_

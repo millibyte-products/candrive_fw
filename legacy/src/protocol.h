@@ -10,6 +10,8 @@
  */
 
 #include <stdint.h>
+#include <stddef.h>
+#include "can_interface.h"
 
 // Handshake protocol
 // Controller & Device Power ON
@@ -45,40 +47,38 @@
 #define STREAM_FLAGS_READ (0x00)
 #define STREAM_FLAGS_WRITE (0x01)
 
-typedef enum {
+typedef enum
+{
     CMD_NOOP = 0x00,
-    CMD_GET_INFO,
-    CMD_GET_INFO_EXT,
+    CMD_ACK,
+    CMD_ERROR,
+    CMD_RESET,
+
+    CMD_GET_INFO,     // Device factory + discoveryinfo
+    CMD_GET_INFO_EXT, // Device runtime info
 
     CMD_GET_POSITION, // Fixed point, 16 bit
     CMD_SET_POSITION, // Fixed point, 16 bit
 
-    CMD_GET_STATUS,
+    CMD_GET_STATUS, // Internal status
 
-    CMD_GET_ANALOG,
+    CMD_GET_ANALOG, // Analog IO pins
 
     CMD_GET_SERVO,
-    CMD_SET_SERVO,
+    CMD_SET_SERVO, // Servio IO pins
 
     CMD_GET_LED,
     CMD_SET_LED, // Device led values
 
-    CMD_GET_MOTOR,
-    CMD_SET_MOTOR,
-
-    CMD_GET_FOC,
-    CMD_SET_FOC,
     // Streams allow uart <-> can bridging
     CMD_STREAM_START, // Start streaming to device UART
-    CMD_STREAM_DATA, // Stream write (TX) data
-    CMD_ACK,
-    CMD_START_FW_UPDATE,
-    CMD_FW_UPDATE,
+    CMD_STREAM_READ,  // Stream write (TX) data
+    CMD_STREAM_WRITE, // Stream read (RX) data
+    CMD_FIRMWARE_UPDATE,
+    CMD_ERASE_FACTORY,
+    CMD_WRITE_FACTORY,
     CMD_NETWORK_RESET,
-    CMD_OVERWRITE_USER_STORE, // Overwrite entire user store, device keys and hardware info
-    CMD_ERASE_USER_STORE, // Erase entire user store, device keys and hardware info
     CMD_REVOKE_CONFIG, // Revoke all configuration data
-    CMD_ERROR,
     // Messages cannot use the 8th bit (controller/device signal)
     INVALID_CMD = 0x7F,
 } command_t;
@@ -87,6 +87,28 @@ typedef enum {
     LED_STAT = 0x01,
     LED_SYS = 0x02,
 } led_address_t;
+
+typedef enum
+{
+    SERVO_0 = 0x01,
+    SERVO_1 = 0x02,
+} servo_address_t;
+
+typedef enum
+{
+    ENDSTOP_0 = 0x01,
+    ENDSTOP_1 = 0x02,
+} endstop_address_t;
+
+typedef enum
+{
+    ERROR_NONE = 0x00,
+    ERROR_INVALID_COMMAND = 0x01,
+    ERROR_INVALID_DATA = 0x02,
+    ERROR_NOT_IMPLEMENTED = 0x03,
+    ERROR_DEVICE_FAULT = 0x04,
+    ERROR_STREAM_FAILURE = 0x05,
+} error_code_t;
 
 typedef enum {
     STREAM_TARGET_USER_STORE = 0x00,
@@ -99,52 +121,56 @@ typedef struct __attribute__((packed, aligned(1))) {
     uint8_t fw_ver_major;
     uint8_t fw_ver_minor;
     uint8_t fw_ver_patch;
-} device_info_t;
+} info_data_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint8_t flags; // reset reason lower 4 bits, fault flags upper 4 bits
     uint8_t temperature;
-} device_info_ext_t;
+} info_ext_data_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint16_t a0;
     uint16_t a1;
-} device_analog_t;
+} analog_data_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint16_t srv0;
     uint16_t srv1;
     uint8_t update_mask;
-} device_servo_t;
+} servo_data_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint8_t sys;
     uint8_t stat;
     uint8_t update_mask;
-} device_led_t;
+} led_data_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint16_t value; // Torque? Voltage?
     uint8_t flags;
-} device_motor_t;
+} motor_data_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint8_t foc_1;
     uint8_t foc_2;
     uint8_t foc_3;
     uint8_t foc_en;
-} device_foc_t;
+} foc_data_t;
 
-typedef struct __attribute__((packed, aligned(1))) {
-    uint8_t stream_target;
-    uint8_t flags;
-    uint32_t stream_length;
+typedef struct __attribute__((packed, aligned(1)))
+{
+    uint16_t stream_length;
+    uint32_t checksum;
 } stream_start_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
-    uint8_t sequence_id;
-    uint8_t data[4]; // PAD with 0xFF if less than 4 bytes
+    uint8_t data[7];
 } stream_data_t;
+
+typedef struct __attribute__((packed, aligned(1)))
+{
+    uint32_t serial_no;
+} revoke_data_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint8_t error_code;
@@ -155,7 +181,7 @@ typedef struct __attribute__((packed, aligned(1))) {
 typedef struct __attribute__((packed, aligned(1))) {
     uint32_t serial_no;
     uint8_t id_value; // Assign or previous ID
-} discovery_message_t;
+} discovery_data_t;
 
 typedef struct __attribute__((packed, aligned(1))) {
     uint8_t command;
@@ -177,5 +203,12 @@ static_assert(sizeof(device_message_t) <= 8, "device_message_t overflows CAN pac
 #define MAG_MASK (0xF0)
 #define RESET_REASON_MASK (0x0F)
 #define FAULT_FLAGS_MASK (0xF0)
+
+void send_discovery_query();
+
+void handle_discovery(uint8_t *data, size_t length);
+void handle_control(uint8_t *data, size_t length);
+void handlne_broadcast(uint8_t *data, size_t length);
+void handle_message(CAN_message_t can_msg);
 
 #endif // PROTOCOL_H_

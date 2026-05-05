@@ -1,3 +1,20 @@
+PAGE_SIZE = 1024;
+FLASH_ORIGIN = 0x08000000;
+RAM_ORIGIN = 0x20000000;
+FLASH_LENGTH = 64K;
+RAM_LENGTH = 20K - 0xEC;
+
+BOOTLOADER_LENGTH = 4 * PAGE_SIZE;
+COMMON_LIB_LENGTH = 4 * PAGE_SIZE;
+USER_STORE_LENGTH = PAGE_SIZE;
+
+APPLICATION_LENGTH = FLASH_LENGTH - BOOTLOADER_LENGTH - USER_STORE_LENGTH;
+
+BOOLOADER_ORIGIN = FLASH_ORIGIN;
+COMMON_LIB_ORIGIN = BOOLOADER_ORIGIN + BOOTLOADER_LENGTH;
+USER_STORE_ORIGIN = COMMON_LIB_ORIGIN + COMMON_LIB_LENGTH;
+APPLICATION_ORIGIN = USER_STORE_ORIGIN + USER_STORE_LENGTH;
+
 /* Linker script to configure memory regions. */
 MEMORY
 {
@@ -37,8 +54,8 @@ ENTRY(Reset_Handler)
 /* Highest address of the user mode stack */
 _estack = ORIGIN(RAM) + LENGTH(RAM);    /* end of RAM */
 /* Generate a link error if heap and stack don't fit into RAM */
-_Min_Heap_Size = 0x1000;      /* required amount of heap  */
-_Min_Stack_Size = 0x1000; /* required amount of stack */
+_Min_Heap_Size = 0x2000;      /* required amount of heap  */
+_Min_Stack_Size = 0x2000; /* required amount of stack */
 
 SECTIONS
 {
