@@ -9,14 +9,20 @@ SQLite database for traceability.
 
 Subcommands:
 
-  flash    : program one device that is already attached. The next free
-             serial number is allocated atomically from the database and
-             written into the USER_STORE flash page.
-  monitor  : watch for ST-Link adapters being plugged in and run `flash`
-             once for each fresh insertion. This is the press-and-flash
-             production loop.
+  flash    : program one device that is already attached. Reads the
+             STM32 factory UID over SWD and refuses re-flash if the
+             UID is already recorded as 'ok' in the DB (override with
+             --force). The next free serial number is allocated
+             atomically and written into the USER_STORE flash page.
+  monitor  : hands-off production loop. The ST-Link adapter stays
+             connected; the script polls the SWD bus for a target's
+             factory UID and flashes once per fresh UID. Designed to
+             run as a systemd service (see tools/systemd/).
   list     : dump recent serials from the DB.
   show     : show one serial's record.
+  lookup   : look up a record by STM32 UID (24-hex).
+  read-uid : read and print the STM32 UID of the attached target
+             without flashing or touching the DB.
   preview  : compute the user_store bytes for a given serial and dump
              them as hex (no flashing, no DB write). Useful for
              validating CRC byte-for-byte against the firmware.
@@ -25,6 +31,8 @@ Examples:
 
   ./tools/production_flash.py flash
   ./tools/production_flash.py monitor
+  ./tools/production_flash.py read-uid
+  ./tools/production_flash.py lookup 1234567890abcdef12345678
   ./tools/production_flash.py list --limit 20
   ./tools/production_flash.py preview 0xCD000007
 
@@ -86,6 +94,11 @@ ADDR_COMMON     = 0x0800_2000
 ADDR_USER_STORE = 0x0800_3000
 ADDR_APP        = 0x0800_3400
 USER_STORE_SIZE = 1024  # one F1 erase page
+
+# 96-bit factory-burned unique ID on STM32F103. Same address on all
+# medium-/high-density F1 parts (RM0008 §30.1).
+ADDR_STM32_UID  = 0x1FFF_F7E0
+STM32_UID_LEN   = 12
 
 USER_STORE_MAGIC   = 0x4352_5355  # "USRC" LE
 USER_STORE_VERSION = 1
@@ -199,6 +212,7 @@ def list_stlinks() -> list[StLink]:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
     serial_no       INTEGER PRIMARY KEY,
+    stm32_uid       TEXT,                       -- 24-char hex, factory UID
     status          TEXT NOT NULL CHECK (status IN ('in_progress','ok','failed')),
     assigned_id     INTEGER,
     started_at      TEXT NOT NULL,
@@ -218,7 +232,16 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status);
 CREATE INDEX IF NOT EXISTS idx_devices_started ON devices(started_at);
+-- One STM32 UID can only be successfully provisioned once (in_progress
+-- and failed rows are allowed to coexist; only 'ok' is uniqued).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_uid_ok
+    ON devices(stm32_uid) WHERE status='ok' AND stm32_uid IS NOT NULL;
 """
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(devices)")}
+    if cols and "stm32_uid" not in cols:
+        conn.execute("ALTER TABLE devices ADD COLUMN stm32_uid TEXT")
 
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,12 +249,21 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+def find_ok_by_uid(conn: sqlite3.Connection, uid: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT serial_no FROM devices WHERE stm32_uid=? AND status='ok' "
+        "ORDER BY serial_no DESC LIMIT 1", (uid,),
+    ).fetchone()
+    return row[0] if row else None
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
 
 def allocate_serial(conn: sqlite3.Connection, *,
+                    stm32_uid: str,
                     stlink_serial: str,
                     operator: str,
                     host: str,
@@ -246,10 +278,10 @@ def allocate_serial(conn: sqlite3.Connection, *,
         cur_max = row[0] if row and row[0] is not None else 0
         next_serial = max(cur_max, FACTORY_SERIAL) + 1
         cur.execute(
-            "INSERT INTO devices (serial_no,status,started_at,operator,host,"
+            "INSERT INTO devices (serial_no,stm32_uid,status,started_at,operator,host,"
             "stlink_serial,git_sha,git_dirty) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (next_serial, "in_progress", now_iso(), operator, host,
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (next_serial, stm32_uid, "in_progress", now_iso(), operator, host,
              stlink_serial, git_sha, 1 if git_dirty else 0),
         )
         cur.execute("COMMIT")
@@ -316,6 +348,62 @@ OPENOCD = os.environ.get("OPENOCD", "openocd")
 INTERFACE_CFG = "interface/stlink.cfg"
 TARGET_CFG    = "target/stm32f1x.cfg"
 
+def _openocd(stlink_serial: str, body_cmds: list[str], *,
+             timeout_s: float) -> tuple[bool, str]:
+    pre = []
+    if stlink_serial:
+        # Must come before target.cfg loads + auto-init.
+        pre += [f"adapter serial {stlink_serial}"]
+    argv = [OPENOCD, "-f", INTERFACE_CFG]
+    for c in pre:
+        argv += ["-c", c]
+    argv += ["-f", TARGET_CFG]
+    for c in body_cmds:
+        argv += ["-c", c]
+    try:
+        proc = subprocess.run(argv, text=True, capture_output=True,
+                              timeout=timeout_s)
+    except subprocess.TimeoutExpired as e:
+        return False, f"openocd timed out after {timeout_s:.1f}s\n{e}"
+    log = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode == 0, log
+
+_MDW_RE = re.compile(r"0x[0-9a-fA-F]+:\s*((?:[0-9a-fA-F]{8}\s*)+)")
+
+def _parse_mdw(log: str) -> Optional[list[int]]:
+    """Extract the 32-bit words printed by OpenOCD `mdw`."""
+    words: list[int] = []
+    for m in _MDW_RE.finditer(log):
+        for tok in m.group(1).split():
+            words.append(int(tok, 16))
+    return words or None
+
+def read_stm32_uid(stlink_serial: str, *, timeout_s: float = 10.0
+                   ) -> tuple[Optional[str], str]:
+    """Halt the target via SWD and read the 96-bit factory UID.
+
+    Returns ``(uid_hex, log)``. ``uid_hex`` is None when no target is
+    present (or the read otherwise fails). The 12 bytes are printed in
+    memory order as a 24-character lowercase hex string."""
+    ok_, log = _openocd(stlink_serial, [
+        "init",
+        "reset halt",
+        f"mdw 0x{ADDR_STM32_UID:08x} {STM32_UID_LEN // 4}",
+        "exit",
+    ], timeout_s=timeout_s)
+    if not ok_:
+        return None, log
+    words = _parse_mdw(log)
+    if not words or len(words) < STM32_UID_LEN // 4:
+        return None, log
+    raw = b""
+    for w in words[:STM32_UID_LEN // 4]:
+        raw += w.to_bytes(4, "little")
+    if raw == b"\x00" * STM32_UID_LEN or raw == b"\xff" * STM32_UID_LEN:
+        # Bus stuck in reset/idle.
+        return None, log
+    return raw.hex(), log
+
 def run_openocd_program(stlink_serial: str,
                         user_store_bin: Path,
                         timeout_s: float = 60.0) -> tuple[bool, str]:
@@ -323,32 +411,14 @@ def run_openocd_program(stlink_serial: str,
 
     OpenOCD's `program` sub-command takes care of `init` + `reset halt`
     + erase + write + verify + reset internally."""
-    pre = []
-    if stlink_serial:
-        # Must come before the target.cfg that calls `init`.
-        pre += [f"adapter serial {stlink_serial}"]
-    flash = [
+    return _openocd(stlink_serial, [
         f"program {BOOTLOADER_BIN} 0x{ADDR_BOOTLOADER:08x} verify",
         f"program {COMMON_BIN} 0x{ADDR_COMMON:08x} verify",
         f"program {user_store_bin} 0x{ADDR_USER_STORE:08x} verify",
         f"program {APP_BIN} 0x{ADDR_APP:08x} verify",
-    ]
-    cmds = flash + ["reset run", "exit"]
-
-    argv = [OPENOCD, "-f", INTERFACE_CFG]
-    for c in pre:
-        argv += ["-c", c]
-    argv += ["-f", TARGET_CFG]
-    for c in cmds:
-        argv += ["-c", c]
-
-    try:
-        proc = subprocess.run(argv, text=True, capture_output=True,
-                              timeout=timeout_s)
-    except subprocess.TimeoutExpired as e:
-        return False, f"openocd timed out after {timeout_s:.0f}s\n{e}"
-    log = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode == 0, log
+        "reset run",
+        "exit",
+    ], timeout_s=timeout_s)
 
 # --- Flash one device --------------------------------------------------------
 
@@ -374,8 +444,26 @@ def cmd_flash(args: argparse.Namespace) -> int:
     link = select_stlink(args.stlink_serial)
     info(f"using ST-Link serial {link.serial!r} (USB pid {link.product})")
 
+    # Read STM32 factory UID first so we can refuse re-flash of a unit
+    # that's already been provisioned.
+    info("reading STM32 factory UID over SWD…")
+    uid, uid_log = read_stm32_uid(link.serial, timeout_s=args.uid_timeout)
+    if uid is None:
+        err("could not read STM32 UID — is the target connected and powered?")
+        if args.verbose:
+            print(uid_log, file=sys.stderr)
+        return 3
+    info(f"STM32 UID = {uid}")
+
+    existing = find_ok_by_uid(db, uid)
+    if existing is not None and not args.force:
+        warn(f"UID {uid} already provisioned as serial "
+             f"{existing:#010x} (decimal {existing}); pass --force to re-flash")
+        return 4
+
     sha, dirty = git_info()
     serial = allocate_serial(db,
+                             stm32_uid=uid,
                              stlink_serial=link.serial,
                              operator=args.operator or os.environ.get("USER",""),
                              host=os.uname().nodename,
@@ -422,16 +510,16 @@ def cmd_flash(args: argparse.Namespace) -> int:
 # --- Monitor mode ------------------------------------------------------------
 
 def cmd_monitor(args: argparse.Namespace) -> int:
+    """Poll the SWD bus for target presence and flash when a new chip
+    appears. The ST-Link USB adapter stays connected; only the target
+    board gets swapped on the SWD header."""
     ensure_images_present()
-    info(f"watching for ST-Link insertions; DB={args.db}")
-    info("Ctrl-C to exit")
-
-    seen: set[str] = {l.serial for l in list_stlinks() if l.serial}
-    if seen and not args.flash_existing:
-        info(f"already attached at startup (skipped): {sorted(seen)}")
-    elif seen and args.flash_existing:
-        # Treat them as freshly inserted.
-        seen.clear()
+    # Resolve the ST-Link once — the adapter is fixed, only the target
+    # changes. Re-resolve lazily if it disappears (USB reset etc.).
+    link = select_stlink(args.stlink_serial)
+    info(f"using ST-Link serial {link.serial!r} (USB pid {link.product})")
+    info(f"watching SWD bus for target insertions; DB={args.db}")
+    info("connect a target to start; Ctrl-C to exit")
 
     stop = False
     def _stop(*_a):
@@ -440,33 +528,51 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    last_uid: Optional[str] = None       # UID of the unit we last saw
+    last_action: Optional[str] = None    # 'flashed' / 'skipped' / 'failed'
+    consecutive_misses = 0
     while not stop:
-        time.sleep(args.poll_interval)
-        cur = list_stlinks()
-        cur_serials = {l.serial for l in cur if l.serial}
-        new = cur_serials - seen
-        gone = seen - cur_serials
-        for g in gone:
-            info(f"ST-Link removed: {g}")
-        for s in sorted(new):
-            link = next((l for l in cur if l.serial == s), None)
-            if link is None:
-                continue
-            info(f"ST-Link inserted: {s} (pid {link.product}) — flashing…")
-            # Settle a moment for the kernel to finish enumeration.
-            time.sleep(args.settle_delay)
-            ns = argparse.Namespace(**vars(args))
-            ns.stlink_serial = s
-            try:
-                rc = cmd_flash(ns)
-            except Exception as exc:
-                err(f"flash exception: {exc}")
-                rc = 99
-            if rc == 0:
-                ok("ready for next unit — unplug + plug the next ST-Link")
-            else:
-                err(f"flash returned {rc}; unit logged as failed")
-        seen = cur_serials
+        # Try to read the UID. If absent, the target is unplugged —
+        # arm the next insertion.
+        uid, uid_log = read_stm32_uid(link.serial, timeout_s=args.uid_timeout)
+        if uid is None:
+            consecutive_misses += 1
+            if last_uid is not None and consecutive_misses >= args.absent_polls:
+                info("target removed; ready for next unit")
+                last_uid = None
+                last_action = None
+            time.sleep(args.poll_interval)
+            continue
+        consecutive_misses = 0
+
+        if uid == last_uid:
+            # Same unit still on the SWD header — don't re-flash.
+            time.sleep(args.poll_interval)
+            continue
+
+        # Fresh target seen.
+        info(f"target detected, UID={uid}")
+        last_uid = uid
+
+        ns = argparse.Namespace(**vars(args))
+        ns.stlink_serial = link.serial
+        try:
+            rc = cmd_flash(ns)
+        except Exception as exc:
+            err(f"flash exception: {exc}")
+            rc = 99
+        if rc == 0:
+            last_action = "flashed"
+            ok("— swap the target board to flash the next unit —")
+        elif rc == 4:
+            last_action = "skipped"
+            warn(f"unit with UID {uid} was already provisioned; "
+                 "swap target to continue")
+        else:
+            last_action = "failed"
+            err(f"flash returned {rc}; logged as failed in DB. "
+                "Swap target to continue.")
+        # Drop into the absent-poll wait until this unit goes away.
     info("monitor exiting")
     return 0
 
@@ -475,7 +581,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     db = open_db(args.db)
     rows = db.execute(
-        "SELECT serial_no,status,started_at,finished_at,duration_ms,"
+        "SELECT serial_no,stm32_uid,status,started_at,duration_ms,"
         "stlink_serial,operator,git_sha "
         "FROM devices ORDER BY serial_no DESC LIMIT ?",
         (args.limit,),
@@ -483,12 +589,13 @@ def cmd_list(args: argparse.Namespace) -> int:
     if not rows:
         info("no records yet")
         return 0
-    print(f"{'serial':>10}  {'status':<12} {'started_at':<21} "
-          f"{'dur_ms':>7}  {'op':<10} {'stlink':<14} git")
-    for sn, status, started, _finished, dur, stlink, op, sha in rows:
+    print(f"{'serial':>10}  {'stm32_uid':<24}  {'status':<12} "
+          f"{'started_at':<21} {'dur_ms':>7}  {'op':<10} "
+          f"{'stlink':<14} git")
+    for sn, uid, status, started, dur, stlink, op, sha in rows:
         sn_s = f"0x{sn:08X}"
-        print(f"{sn_s:>10}  {status:<12} {started or '':<21} "
-              f"{(dur or 0):>7}  {(op or ''):<10} "
+        print(f"{sn_s:>10}  {(uid or '-'):<24}  {status:<12} "
+              f"{started or '':<21} {(dur or 0):>7}  {(op or ''):<10} "
               f"{(stlink or ''):<14} {(sha or '')[:10]}")
     return 0
 
@@ -507,6 +614,35 @@ def cmd_show(args: argparse.Namespace) -> int:
         if c == "serial_no" and isinstance(v, int):
             v = f"0x{v:08X} ({v})"
         print(f"{c:<{width}}  {v}")
+    return 0
+
+def cmd_lookup(args: argparse.Namespace) -> int:
+    db = open_db(args.db)
+    rows = db.execute(
+        "SELECT serial_no,status,started_at,finished_at,duration_ms,"
+        "stlink_serial,operator,git_sha "
+        "FROM devices WHERE stm32_uid=? ORDER BY serial_no",
+        (args.uid.lower(),),
+    ).fetchall()
+    if not rows:
+        info(f"no record for STM32 UID {args.uid}")
+        return 1
+    for sn, status, started, finished, dur, stlink, op, sha in rows:
+        print(f"serial 0x{sn:08X} ({sn})  status={status}  "
+              f"started={started}  finished={finished}  "
+              f"dur_ms={dur}  stlink={stlink}  op={op}  git={sha[:10] if sha else ''}")
+    return 0
+
+def cmd_read_uid(args: argparse.Namespace) -> int:
+    link = select_stlink(args.stlink_serial)
+    info(f"using ST-Link serial {link.serial!r}")
+    uid, log = read_stm32_uid(link.serial, timeout_s=args.uid_timeout)
+    if uid is None:
+        err("could not read STM32 UID")
+        if args.verbose:
+            print(log, file=sys.stderr)
+        return 1
+    print(uid)
     return 0
 
 def cmd_preview(args: argparse.Namespace) -> int:
@@ -541,18 +677,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--operator", help="record an operator name in the DB "
                     "(default: $USER)")
     sp.add_argument("--openocd-timeout", type=float, default=60.0)
+    sp.add_argument("--uid-timeout", type=float, default=10.0,
+                    help="seconds to wait for the STM32 UID readback")
+    sp.add_argument("--force", action="store_true",
+                    help="re-flash even if this STM32 UID is already "
+                    "recorded as 'ok' (allocates a new serial)")
     sp.set_defaults(func=cmd_flash)
 
-    sp = sub.add_parser("monitor", help="press-and-flash production loop")
+    sp = sub.add_parser("monitor", help="hands-off SWD-target flash loop")
+    sp.add_argument("--stlink-serial", help="select a specific ST-Link "
+                    "adapter (the adapter stays connected; only the "
+                    "target on the SWD header gets swapped)")
     sp.add_argument("--operator")
     sp.add_argument("--openocd-timeout", type=float, default=60.0)
-    sp.add_argument("--poll-interval", type=float, default=0.5,
-                    help="USB polling interval in seconds (default 0.5)")
-    sp.add_argument("--settle-delay", type=float, default=0.7,
-                    help="seconds to wait after a new ST-Link appears "
-                    "before invoking openocd (default 0.7)")
-    sp.add_argument("--flash-existing", action="store_true",
-                    help="also flash ST-Links already attached at startup")
+    sp.add_argument("--uid-timeout", type=float, default=10.0)
+    sp.add_argument("--poll-interval", type=float, default=1.0,
+                    help="seconds between SWD UID polls (default 1.0)")
+    sp.add_argument("--absent-polls", type=int, default=2,
+                    help="consecutive failed UID reads required to "
+                    "declare the target unplugged (default 2)")
+    sp.add_argument("--force", action="store_true",
+                    help="re-flash already-provisioned UIDs (debug only)")
     sp.set_defaults(func=cmd_monitor)
 
     sp = sub.add_parser("list", help="list recent serials")
@@ -562,6 +707,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("show", help="show one serial record")
     sp.add_argument("serial", help="serial (decimal or 0x-hex)")
     sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("lookup", help="look up records by STM32 UID")
+    sp.add_argument("uid", help="24-character hex STM32 UID")
+    sp.set_defaults(func=cmd_lookup)
+
+    sp = sub.add_parser("read-uid", help="read & print the target's STM32 UID")
+    sp.add_argument("--stlink-serial")
+    sp.add_argument("--uid-timeout", type=float, default=10.0)
+    sp.set_defaults(func=cmd_read_uid)
 
     sp = sub.add_parser("preview", help="dump user_store bytes (no flash, no DB)")
     sp.add_argument("serial", help="serial (decimal or 0x-hex)")

@@ -109,16 +109,32 @@ For programming new units on the bench (bootloader + common + app +
 a freshly allocated serial number written into `USER_STORE`), use:
 
 ```sh
-sudo ./tools/production_flash.py monitor
+./tools/production_flash.py monitor
 ```
 
-It watches USB for ST-Link insertions and runs one full SWD flash per
-freshly attached adapter. Each unit's serial, image hashes, git SHA,
-operator, and timestamp are recorded in the SQLite database at
+The ST-Link adapter stays connected; the script polls the SWD bus for
+a target's 96-bit STM32 factory UID (`0x1FFFF7E0`) and runs one full
+flash pass per fresh UID. Re-flashing a unit whose UID already has an
+`ok` row in the DB is refused unless `--force` is passed, so the same
+chip can't accidentally be re-provisioned with a new serial.
+
+Each unit's serial, STM32 UID, image hashes, git SHA, operator, and
+timestamps are recorded in the SQLite database at
 `/mnt/bulk/backup/documents/candrive_fw_serials_prod.db` (override with
-`--db`). One-shot mode (`flash`), record listing (`list`/`show`), and
-a `preview` command that prints the user_store bytes for a given serial
-without flashing or DB writes are also available.
+`--db`). Subcommands: `flash` (one-shot), `monitor` (loop), `list`,
+`show <serial>`, `lookup <uid>`, `read-uid` (print the attached
+target's UID without flashing), `preview <serial>` (dump the
+user_store bytes without flashing or DB writes).
+
+A systemd unit at [tools/systemd/candrive-prod-flash.service](tools/systemd/candrive-prod-flash.service)
+runs `monitor` as a daemon for fully hands-off operation:
+
+```sh
+sudo cp tools/systemd/candrive-prod-flash.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now candrive-prod-flash.service
+journalctl -u candrive-prod-flash -f
+```
 
 The user_store record format mirrors `fw/shared/src/user_store.rs`:
 28-byte slot with magic `"USRC"`, serial number, and a CRC-32/MPEG-2
