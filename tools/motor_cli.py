@@ -410,9 +410,11 @@ def cmd_verify(s: socket.socket, *, dev_id: int, listen_for: float,
              struct.pack("<IB", the_serial & 0xFFFFFFFF, dev_id))
         time.sleep(0.05)
 
-    # GetInfo. Wire payload is empty (firmware ignores trailing bytes).
+    # GetInfo. Wire payload: firmware's decoder requires a 7-byte
+    # payload here (matches the reply layout: serial u32 + version u8x3).
+    # Pad with zeros so we don't trip `need(7)` and get silently dropped.
     send(s, CAN_DEVICE_BASE + dev_id,
-         bytes([CMD_GET_INFO | CONTROLLER_BIT]))
+         bytes([CMD_GET_INFO | CONTROLLER_BIT]) + b"\x00" * 7)
     r = _expect_reply_on(s, dev_id, CMD_GET_INFO, timeout=1.5)
     if r is None:
         print(f"[x] no GetInfo reply from device id {dev_id} — not on bus, "

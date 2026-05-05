@@ -733,24 +733,32 @@ def verify_can_boot(expected_serial: int,
     out["seen_serial"] = seen
 
     # Bind it at dev_id so GetInfo/GetStatus can be addressed.
-    _send(CAN_ID_DISCOVERY_ASSIGN, struct.pack("<IB", seen, dev_id))
-    time.sleep(0.05)
-    # GetInfo
-    _send(CAN_DEVICE_BASE + dev_id, bytes([CMD_GET_INFO | CONTROLLER_BIT]))
-    deadline2 = time.monotonic() + 1.5
+    # The bootloader has a slow polling loop, so give the assign a
+    # generous moment to land + retry GetInfo a few times.
     info_reply: Optional[bytes] = None
-    while time.monotonic() < deadline2:
-        f = _recv(deadline2)
-        if f is None: break
-        cid, data = f
-        if cid == CAN_DEVICE_BASE + dev_id and len(data) >= 1 \
-           and (data[0] & 0x7F) == CMD_GET_INFO:
-            info_reply = data; break
+    for attempt in range(4):
+        _send(CAN_ID_DISCOVERY_ASSIGN, struct.pack("<IB", seen, dev_id))
+        time.sleep(0.2)
+        # GetInfo: firmware decoder requires a 7-byte payload (the
+        # reply layout: serial u32 + fw_major/minor/patch). Pad with
+        # zeros for the request side.
+        _send(CAN_DEVICE_BASE + dev_id,
+              bytes([CMD_GET_INFO | CONTROLLER_BIT]) + b"\x00" * 7)
+        deadline2 = time.monotonic() + 0.6
+        while time.monotonic() < deadline2:
+            f = _recv(deadline2)
+            if f is None: break
+            cid, data = f
+            if cid == CAN_DEVICE_BASE + dev_id and len(data) >= 1 \
+               and (data[0] & 0x7F) == CMD_GET_INFO:
+                info_reply = data; break
+        if info_reply is not None:
+            break
+        if verbose:
+            log.append(f"GetInfo attempt {attempt+1} timed out, retrying")
     if info_reply is None:
         s.close()
-        log.append("DiscoveryReq seen but GetInfo did not reply")
-        # It booted at least far enough to broadcast — not a total
-        # failure, but flag it.
+        log.append("DiscoveryReq seen but GetInfo did not reply after 4 retries")
         return False, out
     if len(info_reply) >= 8:
         out["fw_major"] = info_reply[5]
@@ -870,9 +878,16 @@ def cmd_flash(args: argparse.Namespace) -> int:
                                                        6.0),
                                        verbose=args.verbose)
     if not can_ok:
-        msg = ("flashed OK over SWD but no DiscoveryReq with serial "
-               f"0x{serial:08X} on {getattr(args,'can_iface','can0')} "
-               f"within {getattr(args,'can_timeout',6.0):.1f}s")
+        seen = can_info.get("seen_serial")
+        if seen is None:
+            msg = ("flashed OK over SWD but no DiscoveryReq with serial "
+                   f"0x{serial:08X} on {getattr(args,'can_iface','can0')} "
+                   f"within {getattr(args,'can_timeout',6.0):.1f}s — "
+                   "device may not be booting (check bootloader image, "
+                   "boot magic, CAN bus wiring/termination)")
+        else:
+            msg = (f"DiscoveryReq from 0x{seen:08X} seen but device did "
+                   f"not respond to GetInfo on id {DEFAULT_DEV_ID}")
         finalize_failed(db, serial, duration_ms=dt_ms,
                         error=msg + "\n" + "\n".join(can_info["log"]))
         err(msg)
