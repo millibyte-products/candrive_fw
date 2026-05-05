@@ -32,6 +32,7 @@ CMD_GET_LED = 0x09
 CMD_SET_LED = 0x0A
 
 CMD_GET_POSITION = 0x03
+CMD_GET_STATUS   = 0x05
 
 # `update_flag` bits in the SetLed payload.
 LED_UPDATE_STAT = 0x01
@@ -193,6 +194,28 @@ def cmd_get_position(s: socket.socket) -> None:
     print(f"angle_q={q} angle_rad={rad:.6f}")
 
 
+def cmd_get_status(s: socket.socket) -> None:
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_STATUS | CONTROLLER_BIT, 0]))
+    r = expect_reply(s, CMD_GET_STATUS)
+    if r is None:
+        print("timeout"); sys.exit(1)
+    b = r[1]
+    endstop0 = bool(b & 0x01)
+    endstop1 = bool(b & 0x02)
+    misc     = bool(b & 0x04)
+    fault    = bool(b & 0x08)
+    mag      = (b >> 4) & 0x0F
+    # MT6701 status nibble: bit3 push, bit2 no-mag, bit1 weak-mag, bit0 strong-mag.
+    mag_tags = []
+    if mag & 0x01: mag_tags.append("strong")
+    if mag & 0x02: mag_tags.append("weak")
+    if mag & 0x04: mag_tags.append("no_mag")
+    if mag & 0x08: mag_tags.append("push")
+    print(f"raw=0x{b:02x} fault={fault} mag=0x{mag:x} [{','.join(mag_tags) or 'ok'}] "
+          f"endstop0={endstop0} endstop1={endstop1} misc={misc}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iface", default="can0")
@@ -225,6 +248,7 @@ def main() -> None:
                          "of --sys / --stat were given)")
 
     sub.add_parser("get-position", help="read single-turn encoder angle (counts + rad)")
+    sub.add_parser("get-status", help="read status byte (endstops, fault, mag)")
 
     args = p.parse_args()
     s = open_can(args.iface)
@@ -254,6 +278,8 @@ def main() -> None:
         cmd_set_led(s, args.sys, args.stat, mask)
     elif args.cmd == "get-position":
         cmd_get_position(s)
+    elif args.cmd == "get-status":
+        cmd_get_status(s)
 
 
 if __name__ == "__main__":

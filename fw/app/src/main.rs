@@ -113,8 +113,20 @@ fn handle(api: &CommonApi, msg: Message, identity: &mut Slot) -> Action {
                     })),
                 Command::GetInfoExt => Action::reply(build_reply(identity.assigned_id, Command::GetInfoExt,
                     ProtocolData::InfoExt { flags: 0, temperature: 0 })),
-                Command::GetStatus => Action::reply(build_reply(identity.assigned_id, Command::GetStatus,
-                    ProtocolData::Status(StatusBits::default()))),
+                Command::GetStatus => {
+                    // mag: 4-bit MT6701 field-strength status from the
+                    // most recent encoder sample (datasheet bits:
+                    //   3=push-button, 2=no-mag, 1=weak-mag, 0=strong-mag).
+                    // fault: PA10 NFAULT from the DRV gate driver
+                    //   (active-low: a real fault → bit set).
+                    // endstop0/1, misc: not wired on this board rev.
+                    let mag = encoder::last_sample().map(|s| s.status & 0x0F).unwrap_or(0);
+                    let fault = !motor_pwm::fault_ok();
+                    let bits = StatusBits { endstop0: false, endstop1: false,
+                                            misc: false, fault, mag };
+                    Action::reply(build_reply(identity.assigned_id, Command::GetStatus,
+                        ProtocolData::Status(bits)))
+                }
                 Command::GetPosition => {
                     // 14-bit encoder counts → Q-format radians on the
                     // wire (value = counts << 2). See ProtocolData::
@@ -440,8 +452,12 @@ fn main() -> ! {
             hb_counter = hb_counter.wrapping_add(1);
             if hb_counter >= 100_000 {
                 hb_counter = 0;
+                let mag = encoder::last_sample().map(|s| s.status & 0x0F).unwrap_or(0);
+                let fault = !motor_pwm::fault_ok();
+                let bits = StatusBits { endstop0: false, endstop1: false,
+                                        misc: false, fault, mag };
                 let hb = build_reply(identity.assigned_id, Command::GetStatus,
-                    ProtocolData::Status(StatusBits::default()));
+                    ProtocolData::Status(bits));
                 if let Ok(out) = hb.encode() {
                     let _ = (api.can_send)(&out as *const _);
                 }
