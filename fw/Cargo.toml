@@ -6,7 +6,7 @@ members = ["shared", "common", "bootloader", "app"]
 # this via `version.workspace = true`. Bumped automatically by
 # `tools/bump_version.py` after a release.
 [workspace.package]
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 license = "CC-BY-NC-SA-4.0"
 
