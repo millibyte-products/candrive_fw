@@ -30,10 +30,28 @@ use crate::motor_pwm;
 
 const TAU: f32 = core::f32::consts::TAU;
 
-/// Encoder counts per mechanical revolution (14-bit MT6701).
+/// Encoder counts per *raw modulus* (14-bit MT6701 reads 0..16383).
+/// Used only for the FOC electrical-angle math, where `theta_e` is
+/// taken modulo this window to bin the raw reading into a 0..τ
+/// electrical sweep.
 const COUNTS_PER_REV: i32 = 16384;
-/// Radians per count.
+/// Radians of *electrical* angle per raw encoder count, derived from
+/// the 14-bit modulus above. Use ONLY inside the `theta_e` calc.
 const RAD_PER_COUNT: f32 = TAU / 16384.0;
+
+/// Encoder counts per *true mechanical* revolution.
+///
+/// MT6701 nominally returns 16384 counts/rev for a 1× shaft magnet,
+/// but the GM3506 + MT6701 pairing on this board reads at 0.5× (one
+/// physical revolution moves the raw 14-bit reading by ~8192 counts,
+/// verified empirically by hand-rotation: A=1, B=−8240, ΔB=−8241).
+/// Scaling `angle_acc` / velocity by this constant makes user-facing
+/// position commands true-mech radians (π/2 = 90° of rotor). FOC
+/// commutation is unaffected — `theta_e` keeps using `RAD_PER_COUNT`
+/// because elec angle wraps on the raw 16384 modulus regardless.
+const MECH_COUNTS_PER_REV: f32 = 8192.0;
+/// Radians of *true mechanical* angle per raw encoder count.
+const RAD_PER_MECH_COUNT: f32 = TAU / MECH_COUNTS_PER_REV;
 /// HCLK frequency, locked at 64 MHz by `clocks::init`.
 const HCLK_HZ: f32 = 64_000_000.0;
 
@@ -423,7 +441,7 @@ pub fn step() {
     // derived fresh each tick — no float drift, exact across millions
     // of revolutions (i32 overflows at ~131k revs).
     st.mech_total = st.mech_total.wrapping_add(dcounts);
-    st.angle_acc  = (st.mech_total as f32) * RAD_PER_COUNT;
+    st.angle_acc  = (st.mech_total as f32) * RAD_PER_MECH_COUNT;
 
     // Windowed velocity: accumulate counts/dt across many ticks, only
     // recompute vel when the window is wide enough that a single-count
@@ -433,7 +451,7 @@ pub fn step() {
     st.vel_acc_dt += dt;
     const VEL_WINDOW_S: f32 = 0.001;
     if st.vel_acc_dt >= VEL_WINDOW_S {
-        let v_inst = (st.vel_acc_d as f32) * RAD_PER_COUNT / st.vel_acc_dt;
+        let v_inst = (st.vel_acc_d as f32) * RAD_PER_MECH_COUNT / st.vel_acc_dt;
         st.vel = st.vel + 0.25 * (v_inst - st.vel);
         st.vel_acc_d  = 0;
         st.vel_acc_dt = 0.0;

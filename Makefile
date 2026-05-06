@@ -27,7 +27,7 @@ ELFS      := $(addprefix $(BUILD_DIR)/, $(addsuffix .elf, $(TARGETS)))
 BINS      := $(ELFS:.elf=.bin)
 HEXES     := $(ELFS:.elf=.hex)
 
-.PHONY: all clean test size $(TARGETS) flash flash-bootloader flash-common flash-app rust-tools
+.PHONY: all clean test size $(TARGETS) flash flash-bootloader flash-common flash-app flash-can rust-tools
 
 all: $(BINS) $(HEXES)
 	@$(MAKE) -s size
@@ -37,11 +37,19 @@ $(BUILD_DIR):
 
 # Build each crate via cargo (run from fw/ so .cargo/config.toml applies
 # and the thumbv7m-none-eabi target is selected).
+#
+# The .elf rule has a FORCE prereq so `make app` (or `make`) always
+# invokes cargo — cargo does its own incremental change tracking, but
+# Make's mtime comparison would otherwise short-circuit the rebuild
+# whenever the .elf already exists, even after editing source.
+.PHONY: FORCE
+FORCE:
+
 define BUILD_RULE
-$(BUILD_DIR)/$(1).elf: | $(BUILD_DIR)
+$(BUILD_DIR)/$(1).elf: FORCE | $(BUILD_DIR)
 	@echo "  CARGO $(1)"
 	@cd fw && $(CARGO) build $(CARGO_FLAGS) -p candrive-$(1)
-	@cp $(TARGET_DIR)/$(1) $$@
+	@cp -u $(TARGET_DIR)/$(1) $$@ 2>/dev/null || cp $(TARGET_DIR)/$(1) $$@
 
 $(1): $(BUILD_DIR)/$(1).elf
 endef
@@ -90,3 +98,13 @@ flash: $(ELFS)
 	  -c "init" -c "reset halt" \
 	  $(foreach e,$(ELFS),-c "program $(e) verify") \
 	  -c "reset run" -c "exit"
+
+# Rapid iteration: rebuild the app and push it over CAN via the
+# bootloader. Assumes the running app responds on `can0` at device id 5
+# (matches fw_update.py / motor_cli.py defaults). `--trigger` first
+# tells the running app to reboot into the bootloader.
+CAN_IFACE ?= can0
+
+flash-can: $(BUILD_DIR)/app.bin
+	@echo "  CAN-FW $<"
+	@./tools/fw_update.py --iface $(CAN_IFACE) --bin $< --trigger

@@ -88,6 +88,30 @@ make flash-app
 make flash               # all three in one OpenOCD session
 ```
 
+### Rapid iteration over CAN
+
+Once the bootloader + common are programmed via SWD, the app can be
+re-flashed over CAN in one command — no probe, no cables to swap:
+
+```sh
+make flash-can                    # rebuild app, push over can0 to device id 5
+make flash-can CAN_IFACE=can1     # use a different SocketCAN iface
+```
+
+This rebuilds [build/app.bin](build/app.bin) and runs
+`tools/fw_update.py --trigger`, which:
+
+1. Sends the running app a `FirmwareUpdate` request over CAN, causing
+   it to reboot into the bootloader.
+2. Re-discovers the device, streams the new binary, verifies the CRC,
+   and waits for the rebooted app to come back up.
+
+Equivalent path through `dev_setup.py`:
+
+```sh
+./dev_setup.py flash --transport can            # rebuild app + flash over CAN
+```
+
 ## Host CLI
 
 A Rust CLI lives in `tools/`. Build once with `cd tools && cargo build
@@ -102,6 +126,96 @@ Python wrappers (`motor_cli.py`, `fw_update.py`, `position_battery.py`,
 ```
 
 CAN bus: 1 Mbit/s, default device ID 1.
+
+### `motor_cli.py`
+
+[tools/motor_cli.py](tools/motor_cli.py) is the day-to-day bring-up
+and debugging tool. It speaks the binary CAN protocol directly via
+SocketCAN (no separate Rust binary required) and assumes the target
+is already discovered at device ID **5** on `can0`. Override the
+interface with `--iface canX`; the device ID is currently hard-coded
+in the script (`DEV_ID = 5`).
+
+Bring the bus up first (once per boot):
+
+```sh
+sudo ip link set can0 up type can bitrate 1000000
+```
+
+Then run any of the subcommands below. Every subcommand prints a
+single line summarizing the firmware reply and exits non-zero on
+timeout.
+
+#### Discovery / identity
+
+| Command | Purpose |
+|---|---|
+| `verify [--device-id N] [--listen S] [--expect-serial 0xXXXX]` | Post-flash sanity check. Optionally listens for a `DiscoveryReq` from a freshly booted device, assigns it `--device-id`, then issues `GetInfo` and probes `GetStatus` to distinguish app vs. bootloader. Returns rc=2 on no-reply, rc=3 on serial mismatch. |
+| `network-reset` | Broadcast on CAN ID 0: every device on the bus drops its assigned ID and re-enters discovery. |
+| `erase-user-store` | Factory reset: erase saved device ID **and** saved motor params (USER_STORE 1 KiB page). |
+| `revoke-config --serial 0xCAFEBABE` | Drop only the assigned device ID (params kept). `--serial` must match the target's `serial_no` (factory default `0xCAFEBABE`). |
+
+#### Telemetry / inspection
+
+| Command | Reads |
+|---|---|
+| `get-position` | Single-turn encoder angle, raw Q-format counts and radians. |
+| `get-status` | Status byte: endstop0/1, misc, fault, MT6701 magnet status nibble (`strong`/`weak`/`no_mag`/`push`). |
+| `get-analog` | A0 / A1 ADC inputs, raw 12-bit counts and volts. |
+| `get-servo` | Current SRV0 / SRV1 pulse widths (µs). |
+| `get-motor` | Bridge-enable state (`NRST` / `NSLEEP`); `bridge_enabled` is true only when both are high. |
+| `get-foc` | Live per-phase PWM duties (`phase_a`, `phase_c`, `phase_b` out of 255) and FOC enable flag. |
+| `get-led` | SYS / STAT LED duty cycles (0–100%). |
+
+#### Direct actuation
+
+| Command | Notes |
+|---|---|
+| `set-motor on \| off` | Force the gate-driver bridge enable / disable. Required before any closed-loop move. |
+| `set-position TARGET_RAD` | Absolute-shortest move to `TARGET_RAD`. Wrapped to `[0, 2π)` and encoded as Q16 radians. |
+| `set-servo [--s0 US] [--s1 US] [--mask 0xN]` | Set SRV0/SRV1 pulse widths in µs (0 = off). The update mask is auto-built from whichever flags you passed; override with `--mask`. |
+| `set-led [--sys 0..100] [--stat 0..100] [--mask 0xN]` | Set LED duty cycles. Auto-mask follows the same rule as `set-servo`. |
+| `move MODE TARGET` | Set closed-loop control mode + target in one shot. `MODE` ∈ `idle`, `voltage`, `velocity`, `position`, `openloop`, `abs-shortest`, `abs-forward`, `abs-backward`, `relative`. `TARGET` units depend on the mode (volts for `voltage`, radians for the position modes, etc.). |
+
+#### Motor parameters & calibration
+
+| Command | Purpose |
+|---|---|
+| `get-param INDEX` | Read motor param / debug param `INDEX` as f32. Indices < ~32 are tunable params; ≥ 100 are read-only debug telemetry (e.g. param 200 = top byte of `RCC_CSR`). |
+| `set-param INDEX VALUE` | Write a tunable param (RAM only). Use `save-params` afterwards to persist. |
+| `calibrate FREQ_DHZ DUR_MS VALIGN_PCT` | Open-loop spin-up → forward + reverse sweep → reports estimated pole-pairs, encoder zero offset, electrical direction (+1 / −1), and a fault flag. `FREQ_DHZ` is electrical frequency in tenths of Hz, `DUR_MS` per-sweep duration, `VALIGN_PCT` voltage as % of Vbus. Typical: `calibrate 10 4000 25`. The CLI scales its reply timeout with `DUR_MS`. |
+| `save-params` | Commit the current in-RAM motor params (including calibration results) to the USER_STORE flash page. |
+
+#### Quick test sequence
+
+`quick-test` exercises closed-loop position control by stepping
+through ±90° increments forward and then reversing the sequence,
+holding each step for `--dwell` seconds and reading back the encoder
+after each move. It auto-asserts the bridge with `set-motor on`
+before stepping, and forces the controller back to `idle` on exit
+(including Ctrl-C) so the rotor never stays under torque after the
+test ends.
+
+```sh
+./tools/motor_cli.py quick-test                            # one fwd+reverse cycle
+./tools/motor_cli.py quick-test --dwell 1.0 --loops 5      # five cycles, 1 s/step
+./tools/motor_cli.py quick-test --mode abs-shortest        # absolute 0/90/180/270°
+```
+
+Options:
+
+- `--dwell SECONDS` (default `0.5`) — settle time per step.
+- `--mode` (default `relative`):
+  - `relative` — issue ±π/2 deltas from the current rotor angle. Works
+    without a calibrated encoder zero; this is the safe default for
+    bring-up.
+  - `abs-shortest` / `abs-forward` / `abs-backward` — target the
+    cardinal angles 0°, 90°, 180°, 270° in absolute multi-turn space.
+    These **require** a prior successful `calibrate` (and ideally
+    `save-params`); without calibration the FOC has no
+    encoder→electrical mapping and the rotor will freewheel.
+- `--loops N` (default `1`) — repeat the full forward+reverse
+  sequence `N` times.
 
 ## Production flashing
 
