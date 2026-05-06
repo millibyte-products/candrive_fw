@@ -106,6 +106,101 @@ def cmd_get_param(s: socket.socket, idx: int) -> None:
     print(f"param[{idx_r}] = {val}")
 
 
+def _read_param(s: socket.socket, idx: int, timeout: float = 0.5):
+    payload = bytes([idx]) + struct.pack("<f", 0.0)
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_MOTOR_PARAM | CONTROLLER_BIT]) + payload)
+    r = expect_reply(s, CMD_GET_MOTOR_PARAM, timeout=timeout)
+    if r is None:
+        return None
+    return struct.unpack("<f", r[2:6])[0]
+
+
+# Curated snapshot of the most useful indices for FOC / position-loop
+# debugging. Pulled from fw/app/src/motor.rs (config) and
+# fw/app/src/control.rs::debug_get (live state).
+_DUMP_FIELDS = [
+    # (index, label, format_str)
+    (  0, "pole_pairs",            "{:6.2f}"),
+    ( 11, "electrical_zero_offset","{:6.0f} counts"),
+    ( 13, "direction",             "{:+.0f}"),
+    (  4, "voltage_limit",         "{:5.2f} V"),
+    (  5, "voltage_supply",        "{:5.2f} V"),
+    (  6, "velocity_limit",        "{:6.2f} rad/s"),
+    ( 16, "traj_v_max",            "{:6.2f} rad/s"),
+    ( 17, "traj_a_max",            "{:6.1f} rad/s^2"),
+    ( 10, "pid_pos_p",             "{:5.2f}"),
+    ( 14, "pid_pos_i",             "{:5.2f}"),
+    (  7, "pid_vel_p",             "{:5.2f}"),
+    (  8, "pid_vel_i",             "{:5.2f}"),
+    (106, "mode",                  "{:.0f}  (0=Idle 1=V 2=Vel 3=Pos 4=OL)"),
+    (102, "target",                "{:+8.4f} rad"),
+    (109, "traj_setpoint",         "{:+8.4f} rad"),
+    (110, "traj_v",                "{:+7.3f} rad/s"),
+    (100, "angle_acc",             "{:+8.4f} rad"),
+    (101, "vel",                   "{:+7.3f} rad/s"),
+    (104, "last_mech_counts",      "{:6.0f}"),
+    (105, "last_theta_e",          "{:+7.4f} rad"),
+    (103, "last_vq",               "{:+6.3f} V"),
+    (111, "pos_i",                 "{:+6.3f}"),
+    (108, "step_counter",          "{:.0f}"),
+    (132, "mech_total",            "{:.0f} counts"),
+    (130, "dcount_glitches",       "{:.0f}"),
+    (131, "max_|dcounts|",         "{:.0f}"),
+]
+
+
+def cmd_dump(s: socket.socket) -> None:
+    """Snapshot all params useful for FOC / position-loop debugging."""
+    print("=== motor state snapshot ===")
+    for idx, label, fmt in _DUMP_FIELDS:
+        v = _read_param(s, idx)
+        if v is None:
+            print(f"  [{idx:3d}] {label:24s} = <timeout>")
+            continue
+        try:
+            value_str = fmt.format(v)
+        except (ValueError, TypeError):
+            value_str = f"{v}"
+        print(f"  [{idx:3d}] {label:24s} = {value_str}")
+
+
+def cmd_watch(s: socket.socket, indices: list[int], hz: float,
+              duration: float | None) -> None:
+    """Poll the given debug indices repeatedly and print one row per sample.
+
+    Header row labels each column. Useful to watch theta_e / angle_acc /
+    last_vq evolve during a move:
+        ./tools/motor_cli.py watch 100 105 103 102 --hz 20
+    """
+    if not indices:
+        indices = [102, 100, 105, 103, 101]   # target, angle_acc, theta_e, vq, vel
+    period = 1.0 / hz if hz > 0 else 0.0
+    print("t_s," + ",".join(f"p{i}" for i in indices))
+    t0 = time.monotonic()
+    next_t = t0
+    deadline = (t0 + duration) if duration is not None else None
+    try:
+        while True:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                break
+            row = [f"{now - t0:.3f}"]
+            for idx in indices:
+                v = _read_param(s, idx, timeout=0.1)
+                row.append("nan" if v is None else f"{v:+.5g}")
+            print(",".join(row))
+            next_t += period
+            sleep_s = next_t - time.monotonic()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                # Falling behind; reset cadence so we don't spin tight.
+                next_t = time.monotonic()
+    except KeyboardInterrupt:
+        pass
+
+
 def cmd_set_param(s: socket.socket, idx: int, value: float) -> None:
     payload = bytes([idx]) + struct.pack("<f", value)
     send(s, CAN_DEVICE_BASE + DEV_ID,
@@ -322,6 +417,97 @@ def cmd_set_position(s: socket.socket, target_rad: float) -> None:
     print(f"target_q={q_r} target_rad={rad_r:.6f}")
 
 
+def cmd_quick_test(s: socket.socket, dwell_s: float, mode: str,
+                   loops: int) -> None:
+    """One CW revolution then one CCW revolution, dwelling at each
+    90\u00b0 cardinal position.
+
+    Sequence (per loop), starting from the rotor's current angle θ₀:
+        θ₀, θ₀+90\u00b0, θ₀+180\u00b0, θ₀+270\u00b0, θ₀+360\u00b0   (CW, 4 moves)
+        θ₀+270\u00b0, θ₀+180\u00b0, θ₀+90\u00b0, θ₀                (CCW, 4 moves)
+
+    Targets are computed as **absolute multi-turn angles** off the
+    starting position and dispatched as raw Position mode (mode 3)
+    so each step has a fixed goal. Re-issuing the command during a
+    move converges to the same absolute target — the rotor never
+    chases a moving setpoint, which is what causes the "free-running"
+    behaviour seen with the relative / abs-* modes if dwell is too
+    short to fully settle.
+    """
+    if mode not in ("auto", "relative", "abs-shortest", "abs-forward", "abs-backward"):
+        print(f"unknown quick-test mode {mode!r}")
+        sys.exit(2)
+    pi = 3.141592653589793
+    two_pi = 2.0 * pi
+
+    # Make sure the bridge is on so the position controller can act.
+    cmd_set_motor(s, True)
+    time.sleep(0.05)
+
+    # Capture starting angle. Position mode targets the multi-turn
+    # accumulator (which starts at 0 the moment Position mode is first
+    # entered), so we anchor to "0 rad" relative to the test's first
+    # mode entry. We still print the wrapped single-turn angle for
+    # operator reference.
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_POSITION | CONTROLLER_BIT, 0, 0]))
+    pr = expect_reply(s, CMD_GET_POSITION, timeout=0.5)
+    if pr is not None:
+        q = pr[1] | (pr[2] << 8)
+        rad = (q / 65536.0) * two_pi
+        print(f"start angle (wrapped) = {rad * 180.0 / pi:6.1f}\u00b0")
+
+    cw_targets  = [0.0, 0.5 * pi, pi, 1.5 * pi, two_pi]
+    ccw_targets = [1.5 * pi, pi, 0.5 * pi, 0.0]
+
+    if mode == "auto":
+        # Mode 3 = raw Position (absolute multi-turn from mode-entry
+        # zero). This is the only mode that doesn't re-resolve its
+        # target against the current rotor angle on each new command.
+        code = 3
+    else:
+        code = MODE_NAMES[mode]
+
+    try:
+        for loop in range(loops):
+            print(f"\n=== loop {loop+1}/{loops}: CW revolution ===")
+            for i, target in enumerate(cw_targets):
+                _quick_test_step(s, code, target, dwell_s,
+                                 f"CW step {i}/{len(cw_targets)-1}", pi, two_pi)
+            print(f"\n=== loop {loop+1}/{loops}: CCW revolution ===")
+            for i, target in enumerate(ccw_targets):
+                _quick_test_step(s, code, target, dwell_s,
+                                 f"CCW step {i+1}/{len(ccw_targets)}", pi, two_pi)
+    finally:
+        # Always leave the controller in Idle so a stuck loop / Ctrl-C
+        # can't leave the rotor under torque.
+        payload = bytes([MODE_NAMES["idle"]]) + struct.pack("<f", 0.0)
+        send(s, CAN_DEVICE_BASE + DEV_ID,
+             bytes([CMD_SET_MOTOR_COMMAND | CONTROLLER_BIT]) + payload)
+        expect_reply(s, CMD_SET_MOTOR_COMMAND, timeout=0.5)
+
+
+def _quick_test_step(s: socket.socket, mode_code: int, target: float,
+                     dwell_s: float, label: str, pi: float, two_pi: float) -> None:
+    deg = target * 180.0 / pi
+    print(f"  {label}: target = {deg:7.1f}\u00b0")
+    payload = bytes([mode_code]) + struct.pack("<f", target)
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_SET_MOTOR_COMMAND | CONTROLLER_BIT]) + payload)
+    r = expect_reply(s, CMD_SET_MOTOR_COMMAND, timeout=1.0)
+    if r is None:
+        print("    timeout sending move"); sys.exit(1)
+    time.sleep(dwell_s)
+    # Read back encoder for visibility (single-turn wrapped angle).
+    send(s, CAN_DEVICE_BASE + DEV_ID,
+         bytes([CMD_GET_POSITION | CONTROLLER_BIT, 0, 0]))
+    pr = expect_reply(s, CMD_GET_POSITION, timeout=0.5)
+    if pr is not None:
+        q = pr[1] | (pr[2] << 8)
+        rad = (q / 65536.0) * two_pi
+        print(f"    measured (wrapped) = {rad * 180.0 / pi:6.1f}\u00b0")
+
+
 def cmd_network_reset(s: socket.socket) -> None:
     # Broadcast on the controller channel (CAN ID 0).
     send(s, 0x000, bytes([CMD_NETWORK_RESET | CONTROLLER_BIT]))
@@ -466,6 +652,17 @@ def main() -> None:
 
     sub.add_parser("save-params", help="commit current motor params to flash")
 
+    sub.add_parser("dump",
+        help="snapshot all FOC / position-loop debug params (params + live state)")
+    w = sub.add_parser("watch",
+        help="continuously poll a list of param indices and print CSV rows")
+    w.add_argument("indices", nargs="*", type=int,
+                   help="param indices to poll (default: target, angle_acc, theta_e, vq, vel)")
+    w.add_argument("--hz", type=float, default=10.0,
+                   help="poll rate in Hz (default 10)")
+    w.add_argument("--duration", type=float, default=None,
+                   help="stop after this many seconds (default: run until Ctrl-C)")
+
     sub.add_parser("get-led", help="read SYS+STAT LED duty cycles")
     sl = sub.add_parser("set-led", help="set SYS+STAT LED duty cycles (0..100)")
     sl.add_argument("--sys",  type=int, default=0, help="SYS duty 0..100")
@@ -501,6 +698,20 @@ def main() -> None:
     rc.add_argument("--serial", type=lambda v: int(v, 0), required=True,
                     help="device serial_no (factory default 0xCAFEBABE)")
 
+    qt = sub.add_parser("quick-test",
+        help="one CW revolution then one CCW revolution, dwelling at each 90\u00b0")
+    qt.add_argument("--dwell", type=float, default=1.0,
+                    help="seconds to hold each cardinal position (default 1.0)")
+    qt.add_argument("--mode", default="auto",
+                    choices=["auto", "relative", "abs-shortest", "abs-forward", "abs-backward"],
+                    help="`auto` (default): raw Position mode (3) with absolute "
+                         "multi-turn targets — does not chase a moving setpoint, "
+                         "needs no calibration. `relative` / `abs-*` use the "
+                         "matching firmware mode (may chase the setpoint if "
+                         "dwell is shorter than a move).")
+    qt.add_argument("--loops", type=int, default=1,
+                    help="how many CW+CCW cycles to run (default 1)")
+
     vfy = sub.add_parser("verify",
         help="post-flash sanity: discover (or assume), GetInfo, probe app vs bootloader")
     vfy.add_argument("--device-id", type=int, default=DEV_ID,
@@ -524,6 +735,10 @@ def main() -> None:
         cmd_move(s, args.mode, args.target)
     elif args.cmd == "save-params":
         cmd_save_params(s)
+    elif args.cmd == "dump":
+        cmd_dump(s)
+    elif args.cmd == "watch":
+        cmd_watch(s, args.indices, args.hz, args.duration)
     elif args.cmd == "get-led":
         cmd_get_led(s)
     elif args.cmd == "set-led":
@@ -571,6 +786,8 @@ def main() -> None:
         cmd_erase_user_store(s)
     elif args.cmd == "revoke-config":
         cmd_revoke_config(s, args.serial)
+    elif args.cmd == "quick-test":
+        cmd_quick_test(s, args.dwell, args.mode, args.loops)
     elif args.cmd == "verify":
         rc = cmd_verify(s,
                         dev_id=args.device_id,

@@ -296,25 +296,22 @@ def flash_swd_all(images: list[str]) -> int:
 
 
 def flash_can(image: Path, device_id: int) -> int:
-    """Push firmware to a running device over CAN using candrive-cli."""
-    cli_dir = ROOT / "tools"
-    if not cli_dir.exists():
-        fail("tools/ directory missing — cannot use CAN transport")
-    if shutil.which("cargo") is None:
-        fail("cargo not in PATH; cannot run candrive-cli")
-    warn("CAN-based firmware update is currently a stub in candrive-cli "
-         "(see device_manager.rs UpdateFirmware). This will likely error "
-         "until the bootloader/app firmware-update path is finished.")
+    """Push firmware to a running device over CAN via fw_update.py.
+
+    Drives the bootloader's stream-update path: triggers a reboot into
+    BL on the running app, assigns a device id, streams the binary,
+    and waits for the post-reset chatter from the new app.
+    """
+    script = ROOT / "tools" / "fw_update.py"
+    if not script.exists():
+        fail(f"fw_update.py missing at {script}")
     info(f"Sending firmware {image} to device 0x{device_id:X} over CAN")
-    cli_cmd = f"update_firmware {device_id:X} {image}\nexit\n"
     r = subprocess.run(
-        ["cargo", "run", "--quiet", "--bin", "candrive-cli"],
-        cwd=cli_dir,
-        input=cli_cmd,
-        text=True,
+        [str(script), "--bin", str(image), "--trigger"],
+        cwd=ROOT,
     )
     if r.returncode != 0:
-        fail("candrive-cli exited with error")
+        fail(f"fw_update.py exited with code {r.returncode}")
     ok("Flash command dispatched (CAN)")
     return 0
 
@@ -339,8 +336,7 @@ def cmd_flash(args) -> int:
     # CAN-based firmware update (app image only — bootloader/common are
     # programmed via SWD, then app is updated in the field over CAN).
     if args.transport == "can":
-        if args.device_id is None:
-            fail("--device-id required for --transport can")
+        device_id = args.device_id if args.device_id is not None else 5
         if not args.image:
             _make_build(["app"], debug=args.debug)
             image = ROOT / IMAGES["app"][0].replace(".elf", ".bin")
@@ -352,7 +348,7 @@ def cmd_flash(args) -> int:
         if state != "UP":
             warn(f"{args.can_iface} is not up; running `up` first")
             cmd_up(args)
-        return flash_can(image, args.device_id)
+        return flash_can(image, device_id)
     fail(f"unknown transport: {args.transport}")
     return 1
 
