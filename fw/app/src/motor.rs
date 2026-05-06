@@ -97,18 +97,23 @@ impl MotorParams {
             // basis for sizing the position integrator clamp. Default
             // is sized for typical hands-on, low-speed actuator use;
             // raise via SetMotorParam(6, …) for high-speed apps.
-            velocity_limit:   30.0,
-            pid_vel_p:        0.5,
-            pid_vel_i:        10.0,
+            // Position/velocity feedback is in *true mechanical rad*
+            // (8192 enc counts/rev → τ rad/rev). Earlier gains assumed
+            // the encoder-counts-per-rev = 16384 case, so all gains
+            // touching angle or velocity are halved here vs the legacy
+            // values to keep loop response identical.
+            velocity_limit:   15.0,
+            pid_vel_p:        0.25,
+            pid_vel_i:        5.0,
             pid_vel_d:        0.0,
-            pid_pos_p:        20.0,
+            pid_pos_p:        10.0,
             electrical_zero_offset: 0.0,
-            pid_pos_d:        0.05,
+            pid_pos_d:        0.025,
             direction:        1.0,
-            pid_pos_i:        2.0,
+            pid_pos_i:        1.0,
             hold_voltage_limit: 1.5,
-            traj_v_max:       10.0,
-            traj_a_max:       50.0,
+            traj_v_max:       5.0,
+            traj_a_max:       25.0,
             traj_follow_err:  0.3,
         }
     }
